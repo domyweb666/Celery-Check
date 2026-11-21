@@ -58,6 +58,8 @@ jobs:
     steps:
       - name: 檢查簽章用的 secrets
         id: check
+        # 這一步在 checkout 之前，ios 資料夾還不存在
+        working-directory: ${{ github.workspace }}
         run: |
           if [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] && [ -n "$ASC_KEY_P8" ] && [ -n "$APPLE_TEAM_ID" ]; then
             echo "ready=true" >> "$GITHUB_OUTPUT"
