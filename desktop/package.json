@@ -1,0 +1,20 @@
+{
+  "name": "celery-check-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "芹查：iPhone 真機測試回報工具（電腦端）",
+  "type": "module",
+  "main": "server/index.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server/index.js",
+    "mcp": "node server/mcp.js",
+    "fake-phone": "node tools/fake-phone.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "qrcode": "^1.5.4",
+    "ws": "^8.23.0",
+    "zod": "^3.25.0"
+  }
+}

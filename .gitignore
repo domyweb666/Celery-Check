@@ -1,0 +1,12 @@
+# iOS
+ios/*.xcodeproj
+ios/CeleryCheck/Info.plist
+ios/Broadcast/Info.plist
+build/
+DerivedData/
+.DS_Store
+*.xcuserstate
+
+# 電腦端
+desktop/node_modules/
+desktop/data/

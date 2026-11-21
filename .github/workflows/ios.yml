@@ -1,0 +1,156 @@
+name: iOS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: ios
+
+jobs:
+  build:
+    name: 編譯檢查
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 選用最新的正式版 Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          echo "使用 $XCODE"
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: 產生 Xcode 專案
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: 編譯（不簽章）
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project CeleryCheck.xcodeproj \
+            -scheme CeleryCheck \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            build | xcbeautify --renderer github-actions
+
+  testflight:
+    name: 上傳 TestFlight
+    needs: build
+    runs-on: macos-latest
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: 檢查簽章用的 secrets
+        id: check
+        run: |
+          if [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] && [ -n "$ASC_KEY_P8" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::還沒設定 ASC_KEY_ID／ASC_ISSUER_ID／ASC_KEY_P8／APPLE_TEAM_ID，略過 TestFlight 上傳。"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.ready == 'true'
+
+      - name: 選用最新的正式版 Xcode
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: 產生 Xcode 專案
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: 準備 App Store Connect API 金鑰
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          KEY_PATH="$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8"
+          # secret 可能是：.p8 原文、整個檔案的 base64、或只有中間那段。
+          # 也可能帶 BOM、CRLF，或換行被貼成空白。一律拆出金鑰本體再重組成標準 PEM。
+          RAW=$(printf '%s' "$ASC_KEY_P8" | tr -d '\r')
+          RAW="${RAW#$'\xEF\xBB\xBF'}"
+          if ! printf '%s' "$RAW" | grep -q "BEGIN PRIVATE KEY"; then
+            DECODED=$(printf '%s' "$RAW" | tr -d ' \t\n' | base64 --decode 2>/dev/null | tr -d '\r\0' || true)
+            if printf '%s' "$DECODED" | grep -q "BEGIN PRIVATE KEY"; then
+              RAW="$DECODED"
+            fi
+          fi
+          BODY=$(printf '%s' "$RAW" \
+            | sed -e 's/-----BEGIN PRIVATE KEY-----//' -e 's/-----END PRIVATE KEY-----//' \
+            | tr -d ' \t\n')
+          {
+            echo "-----BEGIN PRIVATE KEY-----"
+            printf '%s\n' "$BODY" | fold -w 64
+            echo "-----END PRIVATE KEY-----"
+          } > "$KEY_PATH"
+          echo "金鑰本體 ${#BODY} 個字元（正常的 .p8 約 200 個）"
+          if ! openssl pkey -in "$KEY_PATH" -noout 2>/dev/null; then
+            echo "::error::ASC_KEY_P8 的內容不是有效的 .p8 金鑰。請用 .p8 檔案重新設定這個 secret。"
+            exit 1
+          fi
+          echo "KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: 封存
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project CeleryCheck.xcodeproj \
+            -scheme CeleryCheck \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/CeleryCheck.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            archive | xcbeautify --renderer github-actions
+
+      - name: 匯出並上傳到 TestFlight
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          set -o pipefail
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/CeleryCheck.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"

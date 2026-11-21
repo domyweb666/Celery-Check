@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>芹查</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img src="/icon.svg" alt="" class="brand-icon" />
+        <span class="brand-name">芹查</span>
+      </div>
+      <nav class="tabs">
+        <a href="#live" data-tab="live">即時畫面</a>
+        <a href="#clips" data-tab="clips">片段</a>
+        <a href="#notes" data-tab="notes">回報 <span class="badge" id="todoBadge" hidden></span></a>
+        <a href="#settings" data-tab="settings">設定</a>
+      </nav>
+      <div class="status-area">
+        <span class="rec-pill" id="recPill" hidden>● 錄影中 <span id="recTime">0:00</span></span>
+        <span class="phone-pill" id="phonePill"><span class="dot"></span><span id="phoneText">手機未連線</span></span>
+      </div>
+    </header>
+
+    <main id="app">
+      <!-- 即時畫面 -->
+      <section class="view" id="view-live" hidden>
+        <div class="live-layout">
+          <div class="stage" id="liveStage">
+            <canvas id="liveCanvas" class="phone-canvas" hidden></canvas>
+            <div class="pair-card" id="pairCard">
+              <h2>連上你的 iPhone</h2>
+              <div class="pair-body">
+                <div class="qr" id="qrBox">產生 QR code 中…</div>
+                <ol class="steps">
+                  <li>手機打開<strong>芹查</strong> app，按「掃描電腦上的 QR code」掃左邊這個（用相機 app 掃也可以）</li>
+                  <li>在 app 裡按<strong>「開始投影」</strong>，再按「開始廣播」</li>
+                  <li>手機畫面就會出現在這裡。之後可以直接從控制中心的螢幕錄影按鈕開關</li>
+                </ol>
+              </div>
+              <div class="pair-foot">
+                <label>電腦位址
+                  <select id="ipSelect"></select>
+                </label>
+                <details class="trouble">
+                  <summary>連不上？</summary>
+                  <ul>
+                    <li>手機和電腦要連同一個 Wi-Fi（或電腦接同一台路由器的網路線）</li>
+                    <li>第一次執行時 Windows 會問要不要讓 Node.js 通過防火牆，要勾<strong>「私人網路」</strong>並允許。按錯了的話，到「Windows 安全性 → 防火牆 → 允許應用程式通過防火牆」把 Node.js 的「私人」打勾</li>
+                    <li>Windows 的 Wi-Fi 網路類型要設成「私人網路」，設成「公用」會被擋</li>
+                    <li>上面的位址有好幾個時，選跟手機同一段的那個（通常是 192.168 開頭），再重掃一次</li>
+                    <li>手機 app 第一次會問「要尋找區域網路上的裝置」，要按允許</li>
+                  </ul>
+                </details>
+              </div>
+            </div>
+          </div>
+          <aside class="side">
+            <button class="big-btn mark" id="btnMark">
+              <span class="big-label">標記問題</span>
+              <span class="big-hint" id="markHint">F8</span>
+            </button>
+            <button class="big-btn rec" id="btnRec">
+              <span class="big-label" id="recLabel">開始錄影</span>
+              <span class="big-hint" id="recHint">F9</span>
+            </button>
+            <p class="side-note">
+              芹查一直保留最近 <span id="preSecText">20</span> 秒的畫面。遇到問題按<strong>標記問題</strong>（或踩踏板），就能往回找、框選、寫說明。
+            </p>
+            <div class="side-block">
+              <div class="side-title">最近的片段</div>
+              <ul class="mini-clips" id="recentClips"></ul>
+            </div>
+            <div class="side-block live-meta" id="liveMeta"></div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- 片段清單 -->
+      <section class="view" id="view-clips" hidden>
+        <div class="page-head">
+          <h1>片段</h1>
+          <p class="muted">每次標記或錄影都會存成一個片段。超過 80 個時，最舊、沒勾「保留」的會自動刪掉（已送出的回報不受影響）。</p>
+        </div>
+        <div class="clip-grid" id="clipGrid"></div>
+      </section>
+
+      <!-- 排查（框選） -->
+      <section class="view" id="view-review" hidden>
+        <div class="review-layout">
+          <div class="tools" id="tools">
+            <button data-tool="select" title="選取／移動／刪除（V）">
+              <svg viewBox="0 0 24 24"><path d="M5 3l13 8-6 1.5L9 19z"/></svg><span>選取</span>
+            </button>
+            <button data-tool="rect" title="方框（R）">
+              <svg viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="1.5"/></svg><span>方框</span>
+            </button>
+            <button data-tool="ellipse" title="圓圈（C）">
+              <svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="8" ry="6"/></svg><span>圓圈</span>
+            </button>
+            <button data-tool="arrow" title="箭頭（A）">
+              <svg viewBox="0 0 24 24"><path d="M5 19L19 5M19 5h-7M19 5v7"/></svg><span>箭頭</span>
+            </button>
+            <button data-tool="pen" title="手繪（P）">
+              <svg viewBox="0 0 24 24"><path d="M4 18c3-6 5 2 8-4s4-6 8-8"/></svg><span>手繪</span>
+            </button>
+            <button data-tool="text" title="文字（T）">
+              <svg viewBox="0 0 24 24"><path d="M6 6h12M12 6v13"/></svg><span>文字</span>
+            </button>
+            <div class="tool-sep"></div>
+            <div class="colors" id="colors">
+              <button data-color="#ff3b30" style="--c:#ff3b30" title="紅"></button>
+              <button data-color="#ffcc00" style="--c:#ffcc00" title="黃"></button>
+              <button data-color="#0a84ff" style="--c:#0a84ff" title="藍"></button>
+              <button data-color="#34c759" style="--c:#34c759" title="綠"></button>
+            </div>
+            <div class="tool-sep"></div>
+            <button id="btnUndo" title="復原（Ctrl+Z）">
+              <svg viewBox="0 0 24 24"><path d="M9 7L4 12l5 5M4 12h10a6 6 0 010 12"/></svg><span>復原</span>
+            </button>
+            <button id="btnClear" title="清除全部標註">
+              <svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13"/></svg><span>清除</span>
+            </button>
+          </div>
+
+          <div class="review-center">
+            <div class="review-stage" id="reviewStage">
+              <canvas id="reviewCanvas" class="phone-canvas"></canvas>
+              <input id="textInput" class="text-input" type="text" placeholder="輸入文字後按 Enter" hidden />
+              <div class="anchor-hint" id="anchorHint" hidden>
+                標註畫在第 <span id="anchorTime"></span> 秒那一格
+                <button id="btnGoAnchor">回到那一格</button>
+              </div>
+              <div class="capturing-hint" id="capturingHint" hidden>正在收集標記後的畫面…</div>
+            </div>
+            <div class="timeline">
+              <div class="tl-buttons">
+                <button id="btnFirst" title="第一格">⏮</button>
+                <button id="btnPrev" title="上一格（←）">◀</button>
+                <button id="btnPlay" title="播放／暫停（空白鍵）" class="play">▶</button>
+                <button id="btnNext" title="下一格（→）">▶</button>
+                <button id="btnLast" title="最後一格">⏭</button>
+                <span class="tl-time" id="tlTime">0.0 / 0.0 秒</span>
+                <span class="tl-spacer"></span>
+                <button id="btnRangeIn" title="設成區間起點（I）">[ 起點</button>
+                <button id="btnRangeOut" title="設成區間終點（O）">終點 ]</button>
+                <button id="btnRangeClear" title="取消區間" hidden>取消區間</button>
+              </div>
+              <div class="tl-track" id="tlTrack">
+                <div class="tl-range" id="tlRange" hidden></div>
+                <div class="tl-mark" id="tlMark" title="你按標記的時間點"></div>
+                <div class="tl-anchor" id="tlAnchor" hidden title="標註所在的格"></div>
+                <input type="range" id="tlSlider" min="0" max="0" value="0" step="1" />
+              </div>
+            </div>
+          </div>
+
+          <aside class="review-form" id="reviewForm">
+            <div class="form-mode" id="formMode">
+              <h2>寫回報</h2>
+              <label>專案
+                <select id="fProject"></select>
+              </label>
+              <label>說明
+                <textarea id="fDesc" rows="7" placeholder="哪裡不對？你希望變成怎樣？&#10;例：這個按鈕太靠下，單手按不到，往上移到拇指範圍內"></textarea>
+              </label>
+              <label>標題（可不填，會用說明第一句）
+                <input id="fTitle" type="text" maxlength="80" />
+              </label>
+              <div class="field">
+                <span class="field-label">嚴重度</span>
+                <div class="seg" id="fSeverity">
+                  <button data-v="小">小</button>
+                  <button data-v="中" class="on">中</button>
+                  <button data-v="大">大</button>
+                </div>
+              </div>
+              <div class="range-info" id="rangeInfo"></div>
+              <button class="primary wide" id="btnSubmit">送出回報</button>
+              <p class="muted small">送出後會存成一筆回報：框選處放大圖、整張畫面＋標註、前後連續畫面，加上你的說明。</p>
+            </div>
+            <div class="form-done" id="formDone" hidden>
+              <div class="done-icon">✓</div>
+              <h2 id="doneTitle">已建立回報</h2>
+              <p class="muted" id="doneSub"></p>
+              <button class="primary wide" id="btnCopyPrompt">複製給 Claude</button>
+              <button class="wide" id="btnLaunch">用 Claude Code 開啟</button>
+              <button class="wide ghost" id="btnAnother">在這個片段再標一個問題</button>
+              <button class="wide ghost" id="btnBackLive">回到即時畫面</button>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- 回報清單 -->
+      <section class="view" id="view-notes" hidden>
+        <div class="page-head row">
+          <div>
+            <h1>回報</h1>
+            <div class="chips" id="noteFilter">
+              <button data-f="todo" class="on">待修</button>
+              <button data-f="fixed">待驗收</button>
+              <button data-f="closed">已結案</button>
+              <button data-f="all">全部</button>
+            </div>
+          </div>
+          <div class="head-actions">
+            <select id="noteProject"></select>
+            <button id="btnCopyAll">複製：請 Claude 處理全部待修</button>
+            <button id="btnLaunchAll" class="primary">用 Claude Code 處理全部待修</button>
+          </div>
+        </div>
+        <div class="note-grid" id="noteGrid"></div>
+      </section>
+
+      <!-- 單筆回報 -->
+      <section class="view" id="view-note" hidden>
+        <div class="note-page" id="notePage"></div>
+      </section>
+
+      <!-- 設定 -->
+      <section class="view" id="view-settings" hidden>
+        <div class="settings">
+          <h1>設定</h1>
+
+          <div class="card">
+            <h2>專案</h2>
+            <p class="muted">回報要指定是哪個 app 的。填「電腦上的資料夾」後，就能一鍵在那個資料夾開 Claude Code 處理。</p>
+            <table class="proj-table">
+              <thead><tr><th>名稱</th><th>GitHub repo</th><th>電腦上的資料夾</th><th></th></tr></thead>
+              <tbody id="projRows"></tbody>
+            </table>
+            <button id="btnAddProj">＋ 新增專案</button>
+          </div>
+
+          <div class="card">
+            <h2>標記與錄影</h2>
+            <div class="grid2">
+              <label>標記時往回保留幾秒
+                <input type="number" id="sPre" min="1" max="60" />
+              </label>
+              <label>標記後再多收幾秒
+                <input type="number" id="sPost" min="0" max="30" />
+              </label>
+              <div class="field">
+                <span class="field-label">標記按鍵（可設多個，踏板也行）</span>
+                <div class="keys" id="sMarkKeys"></div>
+              </div>
+              <div class="field">
+                <span class="field-label">錄影開關按鍵</span>
+                <div class="keys" id="sRecKeys"></div>
+              </div>
+            </div>
+            <label class="check"><input type="checkbox" id="sOpenReview" /> 標記後直接打開排查畫面</label>
+            <p class="muted small">按鍵只有在芹查的瀏覽器分頁是目前視窗時才有作用。藍牙踏板要跟<strong>電腦</strong>配對，踩下去才會傳到這裡。</p>
+          </div>
+
+          <div class="card">
+            <h2>手機配對</h2>
+            <label>電腦名稱（手機上會顯示）
+              <input type="text" id="sPcName" />
+            </label>
+            <p class="muted">配對碼藏在 QR code 裡。覺得被別人掃到了，就換一組，手機重掃一次即可。</p>
+            <button id="btnNewToken">更換配對碼</button>
+          </div>
+
+          <div class="card">
+            <h2>連接 Claude Code</h2>
+            <p class="muted">在命令提示字元執行一次下面這行，Claude Code 就會多出芹查的工具（讀回報、標記已修好、截手機畫面）。安裝芹查時如果已經自動註冊過，就不用再做。</p>
+            <div class="codebox"><code id="mcpCmd"></code><button id="btnCopyMcp">複製</button></div>
+          </div>
+
+          <div class="card">
+            <h2>資料</h2>
+            <p class="muted">片段和回報都存在：<code id="dataDir"></code></p>
+          </div>
+
+          <div class="settings-actions">
+            <button class="primary" id="btnSaveSettings">儲存設定</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div class="lightbox" id="lightbox" hidden><img id="lightboxImg" alt="" /></div>
+    <div class="toast" id="toast" hidden></div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,94 @@
+name: CeleryCheck
+options:
+  bundleIdPrefix: org.domyweb
+  developmentLanguage: zh-Hant
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+targets:
+  CeleryCheck:
+    type: application
+    platform: iOS
+    sources:
+      - path: CeleryCheck
+      - path: Shared
+    dependencies:
+      - target: CeleryCheckBroadcast
+    entitlements:
+      path: CeleryCheck/CeleryCheck.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.org.domyweb.celerycheck
+    info:
+      path: CeleryCheck/Info.plist
+      properties:
+        CFBundleDisplayName: 芹查
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        ITSAppUsesNonExemptEncryption: false
+        NSCameraUsageDescription: 需要相機來掃描電腦上的 QR code，才能和電腦配對。
+        NSLocalNetworkUsageDescription: 芹查要透過家裡或辦公室的網路，把手機畫面傳到你的電腦。
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        CFBundleURLTypes:
+          - CFBundleURLName: org.domyweb.celerycheck
+            CFBundleURLSchemes:
+              - celerycheck
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.domyweb.celerycheck
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
+  CeleryCheckBroadcast:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: Broadcast
+      - path: Shared
+    entitlements:
+      path: Broadcast/Broadcast.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.org.domyweb.celerycheck
+    info:
+      path: Broadcast/Info.plist
+      properties:
+        CFBundleDisplayName: 芹查
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSLocalNetworkUsageDescription: 芹查要透過家裡或辦公室的網路，把手機畫面傳到你的電腦。
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.broadcast-services-upload
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SampleHandler
+          RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.domyweb.celerycheck.broadcast
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
+        SKIP_INSTALL: YES
+        APPLICATION_EXTENSION_API_ONLY: YES
+schemes:
+  CeleryCheck:
+    build:
+      targets:
+        CeleryCheck: all
+        CeleryCheckBroadcast: all
+    run:
+      config: Debug
+    archive:
+      config: Release

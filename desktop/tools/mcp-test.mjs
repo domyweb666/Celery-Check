@@ -1,0 +1,14 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+const t = new StdioClientTransport({ command: 'node', args: [new URL('../server/mcp.js', import.meta.url).pathname], env: { ...process.env } });
+const c = new Client({ name: 'test', version: '1' });
+await c.connect(t);
+console.log((await c.listTools()).tools.map((x) => x.name).join(', '));
+const show = (r) => r.content.map((x) => (x.type === 'text' ? x.text : `[${x.type} ${x.mimeType} ${Math.round(x.data.length * 0.75 / 1024)}KB]`)).join('\n');
+console.log(show(await c.callTool({ name: 'celery_list_notes', arguments: {} })));
+console.log(show(await c.callTool({ name: 'celery_get_note', arguments: { id: '1' } })));
+console.log(show(await c.callTool({ name: 'celery_screenshot', arguments: {} })));
+console.log(show(await c.callTool({ name: 'celery_comment', arguments: { id: '1', text: '44pt 是指點擊範圍還是外觀？我先照點擊範圍做。' } })));
+console.log(show(await c.callTool({ name: 'celery_mark_fixed', arguments: { id: '1', summary: '把按鈕點擊範圍改成 48pt，移到畫面下方三分之一。請切到首頁看右下角。' } })));
+console.log(show(await c.callTool({ name: 'celery_get_note', arguments: { id: '99' } })));
+await c.close();
