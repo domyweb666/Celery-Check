@@ -65,7 +65,12 @@ jobs:
             echo "ready=true" >> "$GITHUB_OUTPUT"
           else
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::還沒設定 ASC_KEY_ID／ASC_ISSUER_ID／ASC_KEY_P8／APPLE_TEAM_ID，略過 TestFlight 上傳。"
+            missing=""
+            [ -z "$ASC_KEY_ID" ] && missing="$missing ASC_KEY_ID"
+            [ -z "$ASC_ISSUER_ID" ] && missing="$missing ASC_ISSUER_ID"
+            [ -z "$ASC_KEY_P8" ] && missing="$missing ASC_KEY_P8"
+            [ -z "$APPLE_TEAM_ID" ] && missing="$missing APPLE_TEAM_ID"
+            echo "::notice::讀不到這幾個 secrets：$missing。略過 TestFlight 上傳。"
           fi
 
       - uses: actions/checkout@v4
