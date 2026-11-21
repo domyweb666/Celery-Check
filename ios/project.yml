@@ -36,6 +36,8 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        # 只支援直向時，要宣告全螢幕，App Store 才不會要求支援 iPad 分割畫面
+        UIRequiresFullScreen: true
         ITSAppUsesNonExemptEncryption: false
         NSCameraUsageDescription: 需要相機來掃描電腦上的 QR code，才能和電腦配對。
         NSLocalNetworkUsageDescription: 芹查要透過家裡或辦公室的網路，把手機畫面傳到你的電腦。
