@@ -70,7 +70,7 @@ jobs:
             [ -z "$ASC_ISSUER_ID" ] && missing="$missing ASC_ISSUER_ID"
             [ -z "$ASC_KEY_P8" ] && missing="$missing ASC_KEY_P8"
             [ -z "$APPLE_TEAM_ID" ] && missing="$missing APPLE_TEAM_ID"
-            echo "::notice::讀不到這幾個 secrets：$missing。略過 TestFlight 上傳。"
+            echo "::notice::讀不到這幾個 secrets：${missing}。略過 TestFlight 上傳。"
           fi
 
       - uses: actions/checkout@v4
