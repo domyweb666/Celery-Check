@@ -31,10 +31,11 @@ import {
   readJSON,
   stamp,
   safeId,
+  takeSessionNumber,
 } from './store.js';
 
 const WEB_DIR = path.join(ROOT, 'web');
-const MAX_CLIPS = 80;
+const MAX_CLIPS = 20; // 最多留幾場測試
 let config = loadConfig();
 
 // ---------------------------------------------------------------------------
@@ -151,25 +152,50 @@ function appendFrame(cap, frame) {
     cap.w = frame.w;
     cap.h = frame.h;
   }
-  // 錄影中每 30 格存一次清單，當機也不會全丟
-  if (cap.frames.length % 30 === 0) writeJSON(path.join(cap.dir, 'frames.json'), cap.frames);
+  // 錄影中每 60 格存一次清單，當機也不會全丟
+  if (cap.frames.length % 60 === 0) writeJSON(path.join(cap.dir, 'frames.json'), cap.frames);
 }
 
-function startCapture(kind, { preMs, untilMs, label = '' }) {
+// 開始一場測試：整段錄起來，直到按「結束測試」或手機斷線
+function startSession({ preMs, project = '' }) {
   const id = newClipId();
   const dir = clipDir(id);
   fs.mkdirSync(path.join(dir, 'frames'), { recursive: true });
   const now = Date.now();
-  const cap = { id, dir, kind, frames: [], until: untilMs || null, markTime: now, label, w: 0, h: 0, createdAt: now };
+  const cap = {
+    id,
+    dir,
+    kind: 'session',
+    number: takeSessionNumber(),
+    project,
+    frames: [],
+    markers: [],
+    label: '',
+    keep: false,
+    w: 0,
+    h: 0,
+    createdAt: now,
+  };
   const from = now - preMs;
   for (const fr of ring) if (fr.t >= from) appendFrame(cap, fr);
-  // 畫面靜止時手機不會送新格；把最後一格補進來，片段至少有一張
+  // 畫面靜止時手機不會送新格；把最後一格補進來，至少有一張
   if (!cap.frames.length && latest) appendFrame(cap, latest);
   activeCaptures.set(id, cap);
-  writeClipMeta(cap, 'capturing');
-  if (cap.until) cap.timer = setTimeout(() => finishCapture(id), Math.max(0, cap.until - now) + 300);
-  broadcast({ type: 'clip', clip: readJSON(path.join(dir, 'meta.json'), null) });
+  if (project) config = saveConfig({ lastProject: project });
+  const meta = writeClipMeta(cap, 'capturing');
+  broadcast({ type: 'clip', clip: meta });
   return cap;
+}
+
+function addMarker(cap) {
+  const t = latest ? latest.t : Date.now();
+  // 一秒內連按兩次（例如踏板彈跳）只算一次
+  const last = cap.markers[cap.markers.length - 1];
+  if (last && Math.abs(last.t - t) < 800) return cap.markers.length - 1;
+  cap.markers.push({ t, at: Date.now() });
+  const meta = writeClipMeta(cap, 'capturing');
+  broadcast({ type: 'marker', clip: meta });
+  return cap.markers.length - 1;
 }
 
 function writeClipMeta(cap, status) {
@@ -177,15 +203,18 @@ function writeClipMeta(cap, status) {
   const meta = {
     id: cap.id,
     kind: cap.kind,
+    number: cap.number,
+    project: cap.project,
     label: cap.label,
+    keep: !!cap.keep,
     status,
     createdAt: cap.createdAt,
-    markTime: cap.markTime,
     frameCount: cap.frames.length,
     width: cap.w,
     height: cap.h,
-    start: cap.frames[0]?.t ?? cap.markTime,
-    end: cap.frames[cap.frames.length - 1]?.t ?? cap.markTime,
+    start: cap.frames[0]?.t ?? cap.createdAt,
+    end: cap.frames[cap.frames.length - 1]?.t ?? cap.createdAt,
+    markers: cap.markers,
     thumb: thumbFrame(cap),
     device: phone.device,
   };
@@ -193,12 +222,13 @@ function writeClipMeta(cap, status) {
   return meta;
 }
 
-// 縮圖用哪一格：標記的話取按下去那一刻，錄影取中間
+// 縮圖：有書籤用第一個書籤那格，沒有就用中間
 function thumbFrame(cap) {
   if (!cap.frames.length) return null;
-  if (cap.kind === 'mark') {
+  const t = cap.markers?.[0]?.t;
+  if (t) {
     let best = cap.frames[0];
-    for (const fr of cap.frames) if (fr.t <= cap.markTime) best = fr;
+    for (const fr of cap.frames) if (fr.t <= t) best = fr;
     return best.f;
   }
   return cap.frames[Math.floor(cap.frames.length / 2)].f;
@@ -207,7 +237,6 @@ function thumbFrame(cap) {
 function finishCapture(id) {
   const cap = activeCaptures.get(id);
   if (!cap) return null;
-  clearTimeout(cap.timer);
   activeCaptures.delete(id);
   const meta = writeClipMeta(cap, 'ready');
   broadcast({ type: 'clip', clip: meta });
@@ -215,14 +244,26 @@ function finishCapture(id) {
   return meta;
 }
 
-function recordingClip() {
-  for (const cap of activeCaptures.values()) if (cap.kind === 'record') return cap;
+function activeSession() {
+  for (const cap of activeCaptures.values()) if (cap.kind === 'session') return cap;
   return null;
 }
 
+function sessionSummary(cap) {
+  if (!cap) return null;
+  return { id: cap.id, number: cap.number, project: cap.project, startedAt: cap.createdAt, frames: cap.frames.length, markers: cap.markers.length };
+}
+
+// 舊的場次自動清掉（勾「保留」的、還有草稿沒送出的不刪）
 function pruneClips() {
   const clips = listClips().filter((c) => c.status === 'ready' && !c.keep);
-  for (const c of clips.slice(MAX_CLIPS)) deleteClip(c.id);
+  let kept = 0;
+  for (const c of clips) {
+    const drafts = readJSON(path.join(clipDir(c.id), 'drafts.json'), []);
+    const pending = drafts.some((d) => !d.noteId && (d.description || d.annotations?.length));
+    if (pending) continue;
+    if (++kept > MAX_CLIPS) deleteClip(c.id);
+  }
 }
 
 // 用 ffmpeg 把片段轉成 mp4（有裝 ffmpeg 才能用）
@@ -321,13 +362,7 @@ function pushFrameToBrowsers(frame) {
 }
 
 setInterval(() => {
-  const rec = recordingClip();
-  broadcast({
-    type: 'status',
-    phone: phoneStatus(),
-    recording: rec ? { id: rec.id, startedAt: rec.createdAt, frames: rec.frames.length } : null,
-    capturing: [...activeCaptures.values()].filter((c) => c.kind === 'mark').map((c) => c.id),
-  });
+  broadcast({ type: 'status', phone: phoneStatus(), session: sessionSummary(activeSession()) });
 }, 1000);
 
 // ---------------------------------------------------------------------------
@@ -403,11 +438,13 @@ function claudePrompt(note) {
   };
 }
 
-function allOpenPrompt(project) {
-  const scope = project ? `專案「${project}」的` : '';
+function allOpenPrompt(project, session) {
+  const meta = session ? readJSON(path.join(clipDir(safeId(session)), 'meta.json'), null) : null;
+  const scope = meta ? `第 ${meta.number} 場測試的` : project ? `「${project}」的` : '';
+  const arg = meta ? `（session: ${meta.id}）` : '';
   return {
-    zh: `請用芹查的 MCP 工具處理${scope}所有待修回報：先用 celery_list_notes 列出來，再逐筆用 celery_get_note 讀取、修正，每修好一筆就用 celery_mark_fixed 寫下改了什麼。`,
-    ascii: `Use the celery-check MCP tools: list open reports${project ? ' for this project' : ''} with celery_list_notes${project ? ` (project "${project}")` : ''}, then read each with celery_get_note, fix it, and call celery_mark_fixed with a summary in Traditional Chinese. Reply to me in Traditional Chinese.`,
+    zh: `請用芹查的 MCP 工具處理${scope}所有待修回報：先用 celery_list_notes${arg} 列出來，再逐筆用 celery_get_note 讀取、修正，每修好一筆就用 celery_mark_fixed 寫下改了什麼。全部改完再一起 commit。`,
+    ascii: `Use the celery-check MCP tools: list open reports with celery_list_notes${meta ? ` (session "${meta.id}")` : ''}, then read each with celery_get_note, fix it, and call celery_mark_fixed with a summary in Traditional Chinese. Commit once after all fixes. Reply to me in Traditional Chinese.`,
   };
 }
 
@@ -439,10 +476,9 @@ async function handleApi(req, res, url) {
 
   // ---- 以下只限本機 ----
   if (p === '/api/state' && m === 'GET') {
-    const rec = recordingClip();
     return send(res, 200, {
       phone: phoneStatus(),
-      recording: rec ? { id: rec.id, startedAt: rec.createdAt } : null,
+      session: sessionSummary(activeSession()),
       config: { ...config },
       ffmpeg: hasFfmpeg(),
       platform: process.platform,
@@ -461,11 +497,10 @@ async function handleApi(req, res, url) {
 
   if (p === '/api/config' && m === 'PUT') {
     const body = await readBody(req);
-    const allowed = ['pcName', 'preSeconds', 'postSeconds', 'bufferSeconds', 'markKeys', 'recordKeys', 'openReviewAfterMark', 'projects'];
+    const allowed = ['pcName', 'preSeconds', 'bufferSeconds', 'markKeys', 'recordKeys', 'openReviewAfterMark', 'projects', 'lastProject'];
     const patch = {};
     for (const k of allowed) if (k in body) patch[k] = body[k];
     if ('preSeconds' in patch) patch.preSeconds = Math.min(60, Math.max(1, Number(patch.preSeconds) || 20));
-    if ('postSeconds' in patch) patch.postSeconds = Math.min(30, Math.max(0, Number(patch.postSeconds) || 0));
     patch.bufferSeconds = Math.max(Number(patch.preSeconds ?? config.preSeconds) + 10, Number(patch.bufferSeconds ?? config.bufferSeconds) || 40);
     if (Array.isArray(patch.projects)) {
       patch.projects = patch.projects
@@ -492,56 +527,99 @@ async function handleApi(req, res, url) {
     });
   }
 
-  // ---- 標記與錄影 ----
-  if (p === '/api/mark' && m === 'POST') {
+  // ---- 測試場次 ----
+  if (p === '/api/session/start' && m === 'POST') {
+    const body = await readBody(req);
+    const existing = activeSession();
+    if (existing) return send(res, 200, { ok: true, session: sessionSummary(existing), already: true });
+    if (!latest) return send(res, 409, { error: '手機還沒連上，沒有畫面可以錄' });
+    const cap = startSession({ preMs: 3000, project: String(body.project ?? config.lastProject ?? '') });
+    return send(res, 200, { ok: true, session: sessionSummary(cap) });
+  }
+
+  // 書籤：測試中按 F8／踏板。還沒開始測試的話，自動開始一場，並把前幾十秒補進來
+  if (p === '/api/session/marker' && m === 'POST') {
     if (!latest) return send(res, 409, { error: '手機還沒連上，沒有畫面可以標記' });
-    const cap = startCapture('mark', {
-      preMs: config.preSeconds * 1000,
-      untilMs: Date.now() + config.postSeconds * 1000,
-      label: '標記',
-    });
-    return send(res, 200, { ok: true, clipId: cap.id, markTime: cap.markTime, postSeconds: config.postSeconds });
+    let cap = activeSession();
+    let started = false;
+    if (!cap) {
+      cap = startSession({ preMs: config.preSeconds * 1000, project: config.lastProject || '' });
+      started = true;
+    }
+    const index = addMarker(cap);
+    return send(res, 200, { ok: true, session: sessionSummary(cap), markerIndex: index, started });
   }
 
-  if (p === '/api/record/start' && m === 'POST') {
-    const existing = recordingClip();
-    if (existing) return send(res, 200, { ok: true, clipId: existing.id, already: true });
-    if (!phone.connected) return send(res, 409, { error: '手機還沒連上' });
-    const cap = startCapture('record', { preMs: 2000, untilMs: null, label: '錄影' });
-    return send(res, 200, { ok: true, clipId: cap.id });
-  }
-
-  if (p === '/api/record/stop' && m === 'POST') {
-    const rec = recordingClip();
-    if (!rec) return send(res, 200, { ok: true, clipId: null });
-    const meta = finishCapture(rec.id);
+  if (p === '/api/session/stop' && m === 'POST') {
+    const cap = activeSession();
+    if (!cap) return send(res, 200, { ok: true, clipId: null });
+    const meta = finishCapture(cap.id);
     return send(res, 200, { ok: true, clipId: meta?.id });
   }
 
   // ---- 片段 ----
-  if (p === '/api/clips' && m === 'GET') return send(res, 200, listClips());
+  if (p === '/api/clips' && m === 'GET') {
+    // 順便算每場的草稿和已送出數量
+    const clips = listClips().map((c) => {
+      const drafts = readJSON(path.join(clipDir(c.id), 'drafts.json'), []);
+      const live = activeCaptures.get(c.id);
+      return {
+        ...c,
+        ...(live ? { frameCount: live.frames.length, end: live.frames[live.frames.length - 1]?.t ?? c.end, markers: live.markers } : {}),
+        draftCount: drafts.filter((d) => !d.noteId).length,
+        sentCount: drafts.filter((d) => d.noteId).length,
+      };
+    });
+    return send(res, 200, clips);
+  }
 
   let mm;
   if ((mm = /^\/api\/clips\/([^/]+)$/.exec(p))) {
     const id = safeId(mm[1]);
     if (m === 'GET') {
+      const live = activeCaptures.get(id);
+      if (live) {
+        const meta = readJSON(path.join(clipDir(id), 'meta.json'), {});
+        return send(res, 200, { ...meta, status: 'capturing', project: live.project, markers: live.markers, frames: live.frames, frameCount: live.frames.length });
+      }
       const clip = getClip(id);
-      return clip ? send(res, 200, clip) : send(res, 404, { error: '找不到片段' });
+      return clip ? send(res, 200, clip) : send(res, 404, { error: '找不到這場測試' });
     }
     if (m === 'DELETE') {
-      if (activeCaptures.has(id)) return send(res, 409, { error: '片段還在錄' });
+      if (activeCaptures.has(id)) return send(res, 409, { error: '這場測試還在錄，先按「結束測試」' });
       deleteClip(id);
       return send(res, 200, { ok: true });
     }
     if (m === 'PATCH') {
       const body = await readBody(req);
+      const cap = activeCaptures.get(id);
       const metaPath = path.join(clipDir(id), 'meta.json');
-      const meta = readJSON(metaPath, null);
-      if (!meta) return send(res, 404, { error: '找不到片段' });
+      const meta = cap || readJSON(metaPath, null);
+      if (!meta) return send(res, 404, { error: '找不到這場測試' });
       if ('keep' in body) meta.keep = !!body.keep;
       if ('label' in body) meta.label = String(body.label).slice(0, 60);
+      if ('project' in body) {
+        meta.project = String(body.project);
+        config = saveConfig({ lastProject: meta.project });
+      }
+      if (Array.isArray(body.markers)) meta.markers = body.markers.filter((x) => Number.isFinite(x?.t)).map((x) => ({ t: x.t, at: x.at || x.t }));
+      if (cap) return send(res, 200, writeClipMeta(cap, 'capturing'));
       writeJSON(metaPath, meta);
+      broadcast({ type: 'clip', clip: meta });
       return send(res, 200, meta);
+    }
+  }
+
+  // 草稿：排查時寫到一半的標註和說明，存在伺服器上，關掉瀏覽器也不會不見
+  if ((mm = /^\/api\/clips\/([^/]+)\/drafts$/.exec(p))) {
+    const file = path.join(clipDir(safeId(mm[1])), 'drafts.json');
+    if (m === 'GET') return send(res, 200, readJSON(file, []));
+    if (m === 'PUT') {
+      const body = await readBody(req);
+      if (!Array.isArray(body)) return send(res, 400, { error: '格式不對' });
+      if (!fs.existsSync(path.dirname(file))) return send(res, 404, { error: '找不到這場測試' });
+      writeJSON(file, body);
+      return send(res, 200, { ok: true });
     }
   }
 
@@ -560,6 +638,8 @@ async function handleApi(req, res, url) {
       notes = notes.filter((n) => set.has(n.status));
     }
     if (project) notes = notes.filter((n) => (n.project || '') === project);
+    const session = url.searchParams.get('session');
+    if (session) notes = notes.filter((n) => n.clipId === session);
     return send(res, 200, notes);
   }
 
@@ -568,20 +648,22 @@ async function handleApi(req, res, url) {
     if (!String(body.description || '').trim() && !(body.annotations || []).length) {
       return send(res, 400, { error: '請至少畫一個標註或寫一句說明' });
     }
-    const note = createNote(body);
-    broadcast({ type: 'notes-changed' });
+    const clip = body.clipId ? readJSON(path.join(clipDir(safeId(body.clipId)), 'meta.json'), null) : null;
+    const note = createNote({ ...body, sessionNumber: clip?.number ?? null, project: body.project ?? clip?.project ?? '' });
+    if (!body.quiet) broadcast({ type: 'notes-changed' });
     return send(res, 200, { ok: true, note, prompt: claudePrompt(note).zh });
   }
 
   if (p === '/api/notes/prompt-all' && m === 'GET') {
     const project = url.searchParams.get('project') || '';
-    return send(res, 200, { prompt: allOpenPrompt(project).zh });
+    const session = url.searchParams.get('session') || '';
+    return send(res, 200, { prompt: allOpenPrompt(project, session).zh });
   }
 
   if (p === '/api/notes/launch-all' && m === 'POST') {
     const body = await readBody(req);
     const proj = projectByName(body.project);
-    launchClaude(proj?.localPath, allOpenPrompt(body.project).ascii, `Celery-Check ${body.project || ''}`);
+    launchClaude(proj?.localPath, allOpenPrompt(body.project, body.session).ascii, `Celery-Check ${body.project || ''}`);
     return send(res, 200, { ok: true });
   }
 
@@ -722,8 +804,8 @@ ingestWss.on('connection', (ws, req, url) => {
       phone.connected = false;
       console.log('[手機] 已中斷');
       broadcast({ type: 'phone', event: 'disconnected', phone: phoneStatus() });
-      const rec = recordingClip();
-      if (rec) finishCapture(rec.id);
+      const cap = activeSession();
+      if (cap) finishCapture(cap.id);
     }
   });
   ws.on('error', () => {});

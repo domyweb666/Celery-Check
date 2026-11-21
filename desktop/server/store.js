@@ -28,11 +28,10 @@ const DEFAULT_CONFIG = {
   token: '',
   pcName: '',
   preSeconds: 20,
-  postSeconds: 3,
   bufferSeconds: 40,
   markKeys: ['F8', 'PageDown', 'PageUp'],
   recordKeys: ['F9'],
-  openReviewAfterMark: true,
+  openReviewAfterMark: false,
   // 先放好多米現有的 app，「電腦上的資料夾」到設定頁補
   projects: [
     { name: '茄記', repo: 'domyweb666/qieji-app', localPath: '' },
@@ -46,6 +45,8 @@ const DEFAULT_CONFIG = {
     { name: '芹查', repo: 'domyweb666/Celery-Check', localPath: '' },
   ],
   nextNoteNumber: 1,
+  nextSessionNumber: 1,
+  lastProject: '',
 };
 
 // ---------- 小工具 ----------
@@ -119,7 +120,17 @@ function takeNoteNumber() {
   return n;
 }
 
-// ---------- 片段（clip） ----------
+export function takeSessionNumber() {
+  const raw = { ...DEFAULT_CONFIG, ...readJSON(CONFIG_PATH, {}) };
+  let max = 0;
+  for (const c of listClips()) if (Number.isInteger(c.number) && c.number > max) max = c.number;
+  const n = Math.max(raw.nextSessionNumber || 1, max + 1);
+  raw.nextSessionNumber = n + 1;
+  writeJSON(CONFIG_PATH, raw);
+  return n;
+}
+
+// ---------- 測試場次（clip） ----------
 // data/clips/<id>/meta.json   { id, createdAt, kind: 'mark'|'record', status: 'capturing'|'ready', markTime, frameCount }
 // data/clips/<id>/frames.json [{ f: '000001.jpg', t: 毫秒時間戳 }]
 // data/clips/<id>/frames/*.jpg
@@ -218,13 +229,13 @@ export function createNote(input) {
   const note = {
     id,
     number,
-    title: String(input.title || '').trim() || description.split(/\r?\n/)[0].slice(0, 40) || `回報 #${number}`,
+    title: description.split(/\r?\n/)[0].slice(0, 40) || `回報 #${number}`,
     description,
     project: String(input.project || '').trim(),
-    severity: ['小', '中', '大'].includes(input.severity) ? input.severity : '中',
     status: 'open',
     createdAt: now,
     clipId: input.clipId || null,
+    sessionNumber: input.sessionNumber ?? null,
     frameFile: input.frameFile || null,
     frameTime: input.frameTime ?? null, // 這一格在片段裡的秒數
     range: input.range || null, // { start, end } 秒
@@ -291,14 +302,20 @@ export function describeAnnotations(note) {
     .concat(size ? `\n（座標是相對畫面的百分比，畫面原始大小 ${size.w}×${size.h}）` : '');
 }
 
+function fmtSec(sec) {
+  const s = Number(sec) || 0;
+  if (s < 60) return `${s.toFixed(1)} 秒`;
+  return `${Math.floor(s / 60)} 分 ${(s % 60).toFixed(1)} 秒`;
+}
+
 export function noteToText(note) {
   const lines = [];
   lines.push(`# 芹查回報 #${note.number}：${note.title}`);
-  lines.push(`狀態：${STATUS_LABEL[note.status] || note.status}　嚴重度：${note.severity}　專案：${note.project || '未分類'}`);
-  lines.push(`建立時間：${localTime(note.createdAt)}`);
+  lines.push(`狀態：${STATUS_LABEL[note.status] || note.status}　專案：${note.project || '未分類'}`);
+  lines.push(`建立時間：${localTime(note.createdAt)}${note.sessionNumber ? `（第 ${note.sessionNumber} 場測試）` : ''}`);
   if (note.frameTime != null) {
-    let t = `問題畫面在錄影片段的第 ${Number(note.frameTime).toFixed(1)} 秒`;
-    if (note.range) t += `；多米選的區間是 ${note.range.start.toFixed(1)}–${note.range.end.toFixed(1)} 秒`;
+    let t = `問題畫面在這場測試錄影的第 ${fmtSec(note.frameTime)}`;
+    if (note.range) t += `；多米選的區間是 ${fmtSec(note.range.start)} 到 ${fmtSec(note.range.end)}`;
     lines.push(t);
   }
   lines.push('');

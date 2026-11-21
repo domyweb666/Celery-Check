@@ -15,12 +15,12 @@
       </div>
       <nav class="tabs">
         <a href="#live" data-tab="live">即時畫面</a>
-        <a href="#clips" data-tab="clips">片段</a>
+        <a href="#clips" data-tab="clips">測試場次</a>
         <a href="#notes" data-tab="notes">回報 <span class="badge" id="todoBadge" hidden></span></a>
         <a href="#settings" data-tab="settings">設定</a>
       </nav>
       <div class="status-area">
-        <span class="rec-pill" id="recPill" hidden>● 錄影中 <span id="recTime">0:00</span></span>
+        <a class="rec-pill" id="recPill" hidden>● 測試中 <span id="recTime">0:00</span></a>
         <span class="phone-pill" id="phonePill"><span class="dot"></span><span id="phoneText">手機未連線</span></span>
       </div>
     </header>
@@ -59,19 +59,25 @@
             </div>
           </div>
           <aside class="side">
+            <label class="side-label">這次測哪個 app
+              <select id="liveProject"></select>
+            </label>
+            <button class="big-btn rec" id="btnSession">
+              <span class="big-label" id="sessionLabel">開始測試</span>
+              <span class="big-hint" id="sessionHint">F9</span>
+            </button>
             <button class="big-btn mark" id="btnMark">
-              <span class="big-label">標記問題</span>
+              <span class="big-label" id="markLabel">插書籤</span>
               <span class="big-hint" id="markHint">F8</span>
             </button>
-            <button class="big-btn rec" id="btnRec">
-              <span class="big-label" id="recLabel">開始錄影</span>
-              <span class="big-hint" id="recHint">F9</span>
-            </button>
-            <p class="side-note">
-              芹查一直保留最近 <span id="preSecText">20</span> 秒的畫面。遇到問題按<strong>標記問題</strong>（或踩踏板），就能往回找、框選、寫說明。
-            </p>
+            <button class="wide" id="btnReviewNow" hidden>邊錄邊框選（錄影不會停）</button>
+            <div class="side-note" id="sideNote">
+              <p><strong>開始測試</strong>後整段都會錄起來。遇到問題按<strong>插書籤</strong>（或踩踏板），畫面不會跳走，繼續測就好。</p>
+              <p>測完按<strong>結束測試</strong>，再一個一個書籤框選、寫說明，最後一起送給 Claude。</p>
+              <p>沒開始測試就按插書籤，會自動開始一場，並把前 <span id="preSecText">20</span> 秒補進來。</p>
+            </div>
             <div class="side-block">
-              <div class="side-title">最近的片段</div>
+              <div class="side-title">最近的測試</div>
               <ul class="mini-clips" id="recentClips"></ul>
             </div>
             <div class="side-block live-meta" id="liveMeta"></div>
@@ -82,8 +88,8 @@
       <!-- 片段清單 -->
       <section class="view" id="view-clips" hidden>
         <div class="page-head">
-          <h1>片段</h1>
-          <p class="muted">每次標記或錄影都會存成一個片段。超過 80 個時，最舊、沒勾「保留」的會自動刪掉（已送出的回報不受影響）。</p>
+          <h1>測試場次</h1>
+          <p class="muted">每次測試的整段錄影。最多留 20 場，舊的會自動刪掉；勾「保留」的、還有草稿沒送出的不會刪。已送出的回報不受影響。</p>
         </div>
         <div class="clip-grid" id="clipGrid"></div>
       </section>
@@ -131,10 +137,10 @@
               <canvas id="reviewCanvas" class="phone-canvas"></canvas>
               <input id="textInput" class="text-input" type="text" placeholder="輸入文字後按 Enter" hidden />
               <div class="anchor-hint" id="anchorHint" hidden>
-                標註畫在第 <span id="anchorTime"></span> 秒那一格
+                正在寫 <span id="anchorTime"></span> 那一筆
                 <button id="btnGoAnchor">回到那一格</button>
               </div>
-              <div class="capturing-hint" id="capturingHint" hidden>正在收集標記後的畫面…</div>
+              <div class="capturing-hint" id="capturingHint" hidden>這場測試還在錄，新畫面會自動加進時間軸</div>
             </div>
             <div class="timeline">
               <div class="tl-buttons">
@@ -151,44 +157,50 @@
               </div>
               <div class="tl-track" id="tlTrack">
                 <div class="tl-range" id="tlRange" hidden></div>
-                <div class="tl-mark" id="tlMark" title="你按標記的時間點"></div>
-                <div class="tl-anchor" id="tlAnchor" hidden title="標註所在的格"></div>
+                <div class="tl-ticks" id="tlTicks"></div>
                 <input type="range" id="tlSlider" min="0" max="0" value="0" step="1" />
               </div>
             </div>
           </div>
 
           <aside class="review-form" id="reviewForm">
-            <div class="form-mode" id="formMode">
-              <h2>寫回報</h2>
-              <label>專案
-                <select id="fProject"></select>
+            <div class="sess-head">
+              <div class="sess-title"><span id="sessTitle">第 1 場測試</span> <span class="live-badge" id="sessLive" hidden>● 錄影中</span></div>
+              <div class="muted small" id="sessSub"></div>
+              <label>測哪個 app
+                <select id="sessProject"></select>
               </label>
-              <label>說明
-                <textarea id="fDesc" rows="7" placeholder="哪裡不對？你希望變成怎樣？&#10;例：這個按鈕太靠下，單手按不到，往上移到拇指範圍內"></textarea>
-              </label>
-              <label>標題（可不填，會用說明第一句）
-                <input id="fTitle" type="text" maxlength="80" />
-              </label>
-              <div class="field">
-                <span class="field-label">嚴重度</span>
-                <div class="seg" id="fSeverity">
-                  <button data-v="小">小</button>
-                  <button data-v="中" class="on">中</button>
-                  <button data-v="大">大</button>
-                </div>
-              </div>
-              <div class="range-info" id="rangeInfo"></div>
-              <button class="primary wide" id="btnSubmit">送出回報</button>
-              <p class="muted small">送出後會存成一筆回報：框選處放大圖、整張畫面＋標註、前後連續畫面，加上你的說明。</p>
+              <button class="wide" id="btnStopFromReview" hidden>結束測試</button>
             </div>
+
+            <div class="items-head">
+              <span>書籤與回報</span>
+              <span class="muted small" id="itemsCount"></span>
+            </div>
+            <ul class="items" id="items"></ul>
+
+            <div class="editor" id="editor">
+              <div class="editor-title" id="editorTitle"></div>
+              <textarea id="fDesc" rows="5" placeholder="哪裡不對？你希望變成怎樣？&#10;例：這個按鈕太小，單手按不到，放大一點、往上移"></textarea>
+              <div class="range-info" id="rangeInfo"></div>
+              <div class="editor-actions">
+                <button class="ghost danger" id="btnDelDraft">刪掉這筆</button>
+                <button id="btnNextItem" title="下一個書籤（N）">下一個書籤 →</button>
+              </div>
+            </div>
+
+            <div class="submit-bar">
+              <button class="primary wide" id="btnSubmitAll" disabled>全部送出</button>
+              <p class="muted small" id="submitHint">每筆會附上框選處放大圖、整張畫面＋標註、前後連續畫面，加上你的說明。</p>
+            </div>
+
             <div class="form-done" id="formDone" hidden>
               <div class="done-icon">✓</div>
-              <h2 id="doneTitle">已建立回報</h2>
+              <h2 id="doneTitle">已送出</h2>
               <p class="muted" id="doneSub"></p>
               <button class="primary wide" id="btnCopyPrompt">複製給 Claude</button>
               <button class="wide" id="btnLaunch">用 Claude Code 開啟</button>
-              <button class="wide ghost" id="btnAnother">在這個片段再標一個問題</button>
+              <button class="wide ghost" id="btnKeepEditing">回到這場測試</button>
               <button class="wide ghost" id="btnBackLive">回到即時畫面</button>
             </div>
           </aside>
@@ -237,24 +249,21 @@
           </div>
 
           <div class="card">
-            <h2>標記與錄影</h2>
+            <h2>測試與書籤</h2>
             <div class="grid2">
-              <label>標記時往回保留幾秒
-                <input type="number" id="sPre" min="1" max="60" />
-              </label>
-              <label>標記後再多收幾秒
-                <input type="number" id="sPost" min="0" max="30" />
-              </label>
               <div class="field">
-                <span class="field-label">標記按鍵（可設多個，踏板也行）</span>
+                <span class="field-label">插書籤的按鍵（可設多個，踏板也行）</span>
                 <div class="keys" id="sMarkKeys"></div>
               </div>
               <div class="field">
-                <span class="field-label">錄影開關按鍵</span>
+                <span class="field-label">開始／結束測試的按鍵</span>
                 <div class="keys" id="sRecKeys"></div>
               </div>
+              <label>沒開始測試就插書籤時，往回補幾秒
+                <input type="number" id="sPre" min="1" max="60" />
+              </label>
             </div>
-            <label class="check"><input type="checkbox" id="sOpenReview" /> 標記後直接打開排查畫面</label>
+            <label class="check"><input type="checkbox" id="sOpenReview" /> 插書籤後直接打開排查畫面（邊錄邊框選）</label>
             <p class="muted small">按鍵只有在芹查的瀏覽器分頁是目前視窗時才有作用。藍牙踏板要跟<strong>電腦</strong>配對，踩下去才會傳到這裡。</p>
           </div>
 

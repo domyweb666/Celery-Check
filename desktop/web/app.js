@@ -8,7 +8,8 @@ const S = {
   state: null,
   config: null,
   phone: { connected: false },
-  recording: null,
+  session: null,
+  pendingJumpMarker: null,
   latestBitmap: null,
   view: 'live',
   noteFilter: 'todo',
@@ -111,6 +112,7 @@ function projectByName(name) {
   return (S.config?.projects || []).find((p) => p.name === name) || null;
 }
 
+
 // ---------------------------------------------------------------------------
 // 狀態與即時連線
 // ---------------------------------------------------------------------------
@@ -119,7 +121,7 @@ async function refreshState() {
   S.state = await api('GET', '/api/state');
   S.config = S.state.config;
   S.phone = S.state.phone;
-  S.recording = S.state.recording;
+  S.session = S.state.session;
   updateStatusUi();
   updateKeyHints();
 }
@@ -153,15 +155,15 @@ function onLiveMessage(msg) {
   if (msg.type === 'status' || msg.type === 'hello' || msg.type === 'phone') {
     const was = S.phone.connected;
     S.phone = msg.phone;
-    if ('recording' in msg) S.recording = msg.recording;
+    if ('session' in msg) S.session = msg.session;
     updateStatusUi();
     if (was !== S.phone.connected && S.view === 'live') renderLive();
     if (msg.type === 'phone' && msg.event === 'connected') toast('手機已連上');
     if (msg.type === 'phone' && msg.event === 'disconnected') toast('手機已停止投影');
-  } else if (msg.type === 'clip') {
+  } else if (msg.type === 'clip' || msg.type === 'marker') {
     if (S.view === 'live') renderRecentClips();
     if (S.view === 'clips') renderClips();
-    if (S.view === 'review' && S.review?.clip?.id === msg.clip?.id && msg.clip.status === 'ready') reloadReviewClip();
+    if (S.view === 'review' && S.review?.clip?.id === msg.clip?.id) reloadReviewClip();
   } else if (msg.type === 'notes-changed') {
     refreshBadge();
     if (S.view === 'notes') renderNotes();
@@ -174,12 +176,19 @@ function updateStatusUi() {
   const p = S.phone || {};
   pill.classList.toggle('on', !!p.connected);
   $('#phoneText').textContent = p.connected ? `${p.device || 'iPhone'} 投影中 · ${p.fps || 0} 格/秒` : '手機未連線';
-  const rec = S.recording;
-  $('#recPill').hidden = !rec;
-  if (rec) $('#recTime').textContent = fmtDur(Date.now() - rec.startedAt);
-  const btn = $('#btnRec');
-  btn.classList.toggle('on', !!rec);
-  $('#recLabel').textContent = rec ? `停止錄影（${fmtDur(Date.now() - rec.startedAt)}）` : '開始錄影';
+
+  const ses = S.session;
+  const rec = $('#recPill');
+  rec.hidden = !ses;
+  if (ses) {
+    rec.href = `#review/${ses.id}`;
+    rec.innerHTML = `● 第 ${ses.number} 場測試中 ${fmtDur(Date.now() - ses.startedAt)} · ${ses.markers} 個書籤`;
+  }
+  const btn = $('#btnSession');
+  btn.classList.toggle('on', !!ses);
+  $('#sessionLabel').textContent = ses ? `結束測試（${fmtDur(Date.now() - ses.startedAt)}）` : '開始測試';
+  $('#markLabel').textContent = ses && ses.markers ? `插書籤（已插 ${ses.markers} 個）` : '插書籤';
+  $('#btnReviewNow').hidden = !ses;
   if (S.view === 'live') {
     $('#liveMeta').innerHTML = p.connected
       ? `畫面 ${p.width}×${p.height}<br>手機：${esc(p.device || '')}${p.model ? `（${esc(p.model)}）` : ''}<br>畫面沒變動時手機不會送新格，格數變少是正常的。`
@@ -190,8 +199,8 @@ function updateStatusUi() {
 function updateKeyHints() {
   const mk = (S.config?.markKeys || []).map(keyName).join(' / ');
   const rk = (S.config?.recordKeys || []).map(keyName).join(' / ');
-  $('#markHint').textContent = mk || '未設定按鍵';
-  $('#recHint').textContent = rk || '未設定按鍵';
+  $('#markHint').textContent = mk ? `${mk}（或踩踏板）` : '未設定按鍵';
+  $('#sessionHint').textContent = rk || '未設定按鍵';
   $('#preSecText').textContent = S.config?.preSeconds ?? 20;
 }
 
@@ -211,7 +220,7 @@ async function refreshBadge() {
 function route() {
   const h = location.hash.replace(/^#/, '') || 'live';
   const [view, arg] = h.split('/');
-  if (S.view === 'review' && view !== 'review') stopPlayback();
+  if (S.view === 'review' && view !== 'review') leaveReview();
   S.view = view;
   for (const sec of $$('.view')) sec.hidden = sec.id !== `view-${view}`;
   const tab = view === 'review' ? 'clips' : view === 'note' ? 'notes' : view;
@@ -234,6 +243,7 @@ function renderLive() {
   $('#pairCard').hidden = connected;
   $('#liveCanvas').hidden = !connected;
   if (!connected) loadPair();
+  $('#liveProject').innerHTML = projectOptions(S.session ? S.session.project : S.config?.lastProject || '');
   drawLive();
   renderRecentClips();
   updateStatusUi();
@@ -265,85 +275,106 @@ async function loadPair() {
   }
 }
 
+function sessionName(c) {
+  return `第 ${c.number ?? '?'} 場測試`;
+}
+
 async function renderRecentClips() {
   try {
-    const clips = (await api('GET', '/api/clips')).slice(0, 6);
+    const clips = (await api('GET', '/api/clips')).slice(0, 5);
     $('#recentClips').innerHTML = clips.length
       ? clips
           .map(
             (c) => `<li data-id="${c.id}">
               ${c.thumb ? `<img src="/clips/${c.id}/frames/${c.thumb}" alt="">` : '<img alt="">'}
-              <div><div class="t">${c.kind === 'record' ? '錄影' : '標記'} · ${fmtTime(c.createdAt)}</div>
-              <div class="s">${c.status === 'capturing' ? '收集中…' : `${fmtDur(c.end - c.start)}，${c.frameCount} 格`}</div></div></li>`,
+              <div><div class="t">${sessionName(c)}${c.project ? ` · ${esc(c.project)}` : ''}</div>
+              <div class="s">${c.status === 'capturing' ? '錄影中…' : `${fmtTime(c.createdAt)}，${fmtDur(c.end - c.start)}`}，${(c.markers || []).length} 個書籤</div></div></li>`,
           )
           .join('')
-      : '<li class="s" style="cursor:default">還沒有片段</li>';
+      : '<li class="s" style="cursor:default">還沒有測試</li>';
   } catch {}
 }
 
-async function doMark() {
+async function doMarker() {
   try {
-    const r = await api('POST', '/api/mark');
-    const busy = S.view === 'review' && S.review && S.review.annotations.length && !S.review.submitted;
-    if (S.config.openReviewAfterMark && !busy) {
-      location.hash = `#review/${r.clipId}`;
-    } else {
-      toast('已標記，片段存在「片段」頁');
-      if (S.view === 'live') renderRecentClips();
+    const r = await api('POST', '/api/session/marker');
+    S.session = r.session;
+    updateStatusUi();
+    if (r.started) toast(`已開始第 ${r.session.number} 場測試，插入第 1 個書籤`);
+    else toast(`書籤 ${r.markerIndex + 1}`, false, 1200);
+    const reviewingThis = S.view === 'review' && S.review?.clip?.id === r.session.id;
+    if (S.config.openReviewAfterMark && !reviewingThis) {
+      S.pendingJumpMarker = r.markerIndex;
+      location.hash = `#review/${r.session.id}`;
     }
   } catch (e) {
     toast(e.message, true);
   }
 }
 
-async function toggleRecord() {
+async function toggleSession() {
   try {
-    if (S.recording) {
-      const r = await api('POST', '/api/record/stop');
-      S.recording = null;
+    if (S.session) {
+      const id = S.session.id;
+      await api('POST', '/api/session/stop');
+      S.session = null;
       updateStatusUi();
-      if (r.clipId) {
-        toast('錄影已存成片段');
-        location.hash = `#review/${r.clipId}`;
-      }
+      toast('測試結束，開始一個一個框選吧');
+      if (S.view === 'review' && S.review?.clip?.id === id) reloadReviewClip();
+      else location.hash = `#review/${id}`;
     } else {
-      const r = await api('POST', '/api/record/start');
-      S.recording = { id: r.clipId, startedAt: Date.now() };
+      const r = await api('POST', '/api/session/start', { project: $('#liveProject').value });
+      S.session = r.session;
       updateStatusUi();
-      toast('開始錄影，再按一次停止');
+      toast(`第 ${r.session.number} 場測試開始，遇到問題就插書籤`);
     }
   } catch (e) {
     toast(e.message, true);
   }
 }
+
+$('#liveProject').addEventListener('change', async (e) => {
+  const project = e.target.value;
+  try {
+    if (S.session) await api('PATCH', `/api/clips/${S.session.id}`, { project });
+    else await api('PUT', '/api/config', { lastProject: project });
+    S.config.lastProject = project;
+  } catch (err) {
+    toast(err.message, true);
+  }
+});
 
 // ---------------------------------------------------------------------------
-// 片段清單
+// 測試場次清單
 // ---------------------------------------------------------------------------
 
 async function renderClips() {
   const grid = $('#clipGrid');
   const clips = await api('GET', '/api/clips');
   if (!clips.length) {
-    grid.innerHTML = '<div class="empty">還沒有片段。手機連上後，在「即時畫面」按「標記問題」或「開始錄影」。</div>';
+    grid.innerHTML = '<div class="empty">還沒有測試。手機連上後，在「即時畫面」按「開始測試」或「插書籤」。</div>';
     return;
   }
   grid.innerHTML = clips
-    .map(
-      (c) => `<div class="clip-card" data-id="${c.id}">
+    .map((c) => {
+      const markers = (c.markers || []).length;
+      const stats = [`${markers} 個書籤`];
+      if (c.draftCount) stats.push(`${c.draftCount} 筆草稿`);
+      if (c.sentCount) stats.push(`已送出 ${c.sentCount} 筆`);
+      return `<div class="clip-card" data-id="${c.id}">
         <div class="clip-thumb" data-open="${c.id}">${c.thumb ? `<img src="/clips/${c.id}/frames/${c.thumb}" alt="">` : ''}</div>
         <div class="clip-body">
-          <div class="t">${c.kind === 'record' ? '錄影' : '標記'} · ${fmtTime(c.createdAt)}</div>
-          <div class="s">${c.status === 'capturing' ? '收集中…' : `長度 ${fmtDur(c.end - c.start)}，${c.frameCount} 格`}${c.keep ? '，已保留' : ''}</div>
+          <div class="t">${sessionName(c)}${c.project ? ` · ${esc(c.project)}` : ''}</div>
+          <div class="s">${c.status === 'capturing' ? '<span style="color:var(--red)">● 錄影中</span>' : fmtTime(c.createdAt)}，長度 ${fmtDur(c.end - c.start)}<br>${stats.join('，')}${c.keep ? '，已保留' : ''}</div>
           <div class="clip-actions">
             <button data-open="${c.id}" class="primary">排查</button>
-            ${S.state?.ffmpeg ? `<button data-export="${c.id}">匯出 MP4</button>` : ''}
+            ${S.state?.ffmpeg && c.status !== 'capturing' ? `<button data-export="${c.id}">匯出 MP4</button>` : ''}
             <button data-keep="${c.id}" data-v="${c.keep ? 0 : 1}">${c.keep ? '取消保留' : '保留'}</button>
-            <button data-del="${c.id}" class="danger">刪除</button>
+            ${c.status !== 'capturing' ? `<button data-del="${c.id}" class="danger">刪除</button>` : ''}
           </div>
         </div>
-      </div>`,
-    )
+      </div>`;
+    })
     .join('');
 }
 
@@ -362,7 +393,7 @@ $('#clipGrid').addEventListener('click', async (e) => {
       await api('PATCH', `/api/clips/${t.dataset.keep}`, { keep: t.dataset.v === '1' });
       renderClips();
     } else if (t.dataset.del) {
-      if (!confirm('刪除這個片段？已送出的回報不受影響。')) return;
+      if (!confirm('刪除這場測試的錄影和草稿？已送出的回報不受影響。')) return;
       await api('DELETE', `/api/clips/${t.dataset.del}`);
       renderClips();
     }
@@ -378,100 +409,186 @@ $('#recentClips').addEventListener('click', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// 排查：時間軸＋框選
+// 排查：時間軸、書籤、每格一筆草稿
 // ---------------------------------------------------------------------------
 
 const canvas = $('#reviewCanvas');
 const ctx = canvas.getContext('2d');
 
-function newReviewState(clip) {
+// R.drafts：[{ id, f, t, markerT, annotations, description, range:{startT,endT}|null, noteId, number }]
+function newReviewState(clip, drafts) {
   return {
     clip,
     frames: clip.frames,
+    markers: clip.markers || [],
+    drafts,
     index: 0,
-    markIndex: 0,
     images: new Map(),
-    annotations: [],
+    activeId: null,
     undo: [],
-    anchor: null, // 標註畫在哪一格
-    rangeIn: null,
-    rangeOut: null,
     drawing: null,
     selected: -1,
     dragFrom: null,
     playing: false,
     playTimer: null,
-    submitted: null,
-    severity: '中',
+    saveTimer: null,
     pollTimer: null,
     userMoved: false,
   };
 }
 
-function markIndexOf(clip) {
-  let idx = 0;
-  clip.frames.forEach((f, i) => {
-    if (f.t <= clip.markTime) idx = i;
-  });
-  return idx;
+function leaveReview() {
+  const R = S.review;
+  if (!R) return;
+  stopPlayback();
+  flushSave();
+  clearInterval(R.pollTimer);
+  R.pollTimer = null;
+}
+
+// 時間 t 對應的格（t 之前最後一格）
+function frameIndexAt(t) {
+  const fr = S.review.frames;
+  let lo = 0, hi = fr.length - 1, ans = 0;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (fr[mid].t <= t) {
+      ans = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return ans;
+}
+
+function indexOfFile(f) {
+  const i = S.review.frames.findIndex((x) => x.f === f);
+  return i < 0 ? 0 : i;
+}
+
+function relSec(i) {
+  const R = S.review;
+  return (R.frames[i].t - R.frames[0].t) / 1000;
+}
+
+function fmtRel(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec - m * 60;
+  return `${m}:${s.toFixed(1).padStart(4, '0')}`;
+}
+
+function liveDrafts() {
+  return S.review.drafts.filter((d) => !d.removed);
+}
+
+function draftAtIndex(i) {
+  const f = S.review.frames[i]?.f;
+  return liveDrafts().find((d) => d.f === f) || null;
+}
+
+function activeDraft() {
+  const R = S.review;
+  return liveDrafts().find((d) => d.id === R.activeId) || null;
+}
+
+function markerAtIndex(i) {
+  const R = S.review;
+  return R.markers.find((m) => frameIndexAt(m.t) === i) || null;
+}
+
+function draftHasContent(d) {
+  return !!(d.annotations.length || d.description.trim() || d.range);
+}
+
+function createDraftAt(i) {
+  const R = S.review;
+  const m = markerAtIndex(i);
+  const d = {
+    id: `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    f: R.frames[i].f,
+    t: R.frames[i].t,
+    markerT: m ? m.t : null,
+    annotations: [],
+    description: '',
+    range: null,
+    noteId: null,
+  };
+  R.drafts.push(d);
+  return d;
 }
 
 async function openReview(id) {
   if (!id) return (location.hash = '#clips');
   if (S.review?.clip?.id === id && S.review.frames.length) {
-    drawReview();
+    S.review.pollTimer = S.review.pollTimer || (S.review.clip.status === 'capturing' ? setInterval(reloadReviewClip, 2000) : null);
+    await reloadReviewClip();
+    jumpPendingMarker();
     return;
   }
-  let clip;
+  let clip, drafts;
   try {
-    clip = await api('GET', `/api/clips/${id}`);
+    [clip, drafts] = await Promise.all([api('GET', `/api/clips/${id}`), api('GET', `/api/clips/${id}/drafts`)]);
   } catch {
-    toast('找不到這個片段', true);
+    toast('找不到這場測試', true);
     return (location.hash = '#clips');
   }
-  if (S.review?.pollTimer) clearInterval(S.review.pollTimer);
-  S.review = newReviewState(clip);
+  if (S.review) leaveReview();
+  S.review = newReviewState(clip, drafts.map((d) => ({ annotations: [], description: '', range: null, ...d })));
   const R = S.review;
-  R.markIndex = clip.kind === 'mark' ? markIndexOf(clip) : 0;
-  R.index = R.markIndex;
-  $('#fProject').innerHTML = projectOptions(localStorage.getItem('cc.lastProject') || '');
-  $('#fDesc').value = '';
-  $('#fTitle').value = '';
-  setSeverity('中');
   showForm();
+  renderReviewHead();
   setupTimeline();
-  await showFrame(R.index);
-  if (clip.status === 'capturing') {
-    $('#capturingHint').hidden = false;
-    R.pollTimer = setInterval(reloadReviewClip, 1000);
-  } else $('#capturingHint').hidden = true;
-  setTimeout(() => $('#fDesc').focus(), 50);
+  // 一進來先跳到第一個還沒處理的書籤；沒有書籤就從頭（錄影中就看最新）
+  const firstOpen = R.markers.find((m) => !draftAtIndex(frameIndexAt(m.t)));
+  let start = firstOpen ? frameIndexAt(firstOpen.t) : clip.status === 'capturing' ? R.frames.length - 1 : 0;
+  if (S.pendingJumpMarker != null && R.markers[S.pendingJumpMarker]) start = frameIndexAt(R.markers[S.pendingJumpMarker].t);
+  S.pendingJumpMarker = null;
+  await showFrame(start);
+  if (clip.status === 'capturing') R.pollTimer = setInterval(reloadReviewClip, 2000);
+}
+
+function jumpPendingMarker() {
+  const R = S.review;
+  if (S.pendingJumpMarker == null || !R) return;
+  const m = R.markers[S.pendingJumpMarker];
+  S.pendingJumpMarker = null;
+  if (m) showFrame(frameIndexAt(m.t));
 }
 
 async function reloadReviewClip() {
   const R = S.review;
   if (!R) return;
-  const clip = await api('GET', `/api/clips/${R.clip.id}`);
+  let clip;
+  try {
+    clip = await api('GET', `/api/clips/${R.clip.id}`);
+  } catch {
+    return;
+  }
+  if (S.review !== R) return;
   R.clip = clip;
   R.frames = clip.frames;
-  if (clip.status === 'ready') {
+  R.markers = clip.markers || [];
+  if (clip.status !== 'capturing') {
     clearInterval(R.pollTimer);
     R.pollTimer = null;
-    $('#capturingHint').hidden = true;
   }
-  if (!R.userMoved && clip.kind === 'mark') R.index = markIndexOf(clip);
+  renderReviewHead();
   setupTimeline();
-  showFrame(R.index);
+  renderItems();
+  updateTimeLabel();
 }
 
-function frameUrl(i) {
-  return `/clips/${S.review.clip.id}/frames/${S.review.frames[i].f}`;
-}
-
-function getFrameImage(i) {
+function renderReviewHead() {
   const R = S.review;
-  if (!R.images.has(i)) R.images.set(i, loadImage(frameUrl(i)));
-  return R.images.get(i);
+  const c = R.clip;
+  const live = c.status === 'capturing';
+  $('#sessTitle').textContent = sessionName(c);
+  $('#sessLive').hidden = !live;
+  $('#capturingHint').hidden = !live;
+  $('#btnStopFromReview').hidden = !live;
+  const dur = R.frames.length ? R.frames[R.frames.length - 1].t - R.frames[0].t : 0;
+  $('#sessSub').textContent = `${fmtTime(c.createdAt)} 開始，長度 ${fmtDur(dur)}`;
+  const sel = $('#sessProject');
+  if (document.activeElement !== sel) sel.innerHTML = projectOptions(c.project || '');
 }
 
 async function showFrame(i) {
@@ -480,7 +597,18 @@ async function showFrame(i) {
   i = Math.max(0, Math.min(R.frames.length - 1, i));
   R.index = i;
   $('#tlSlider').value = i;
+  // 換格時：這格有草稿就編輯它，沒有就準備在這格新增一筆。
+  // 選區間（起點／終點）會套用到最後編輯的那一筆，所以另外記著。
+  if (R.activeId) R.rangeTargetId = R.activeId;
+  const d = draftAtIndex(i);
+  R.activeId = d ? d.id : null;
+  R.selected = -1;
   updateTimeLabel();
+  if (!R.playing) {
+    renderEditor();
+    renderItems();
+    setupTimeline();
+  }
   const img = await getFrameImage(i);
   if (S.review !== R || R.index !== i) return;
   R.currentImage = img;
@@ -489,20 +617,30 @@ async function showFrame(i) {
     canvas.height = img.naturalHeight;
   }
   drawReview();
-  // 預先載入前後幾格，拖時間軸比較順
-  for (const d of [1, 2, 3, -1, -2]) if (R.frames[i + d]) getFrameImage(i + d);
+  for (const dd of [1, 2, 3, -1, -2]) if (R.frames[i + dd]) getFrameImage(i + dd);
 }
 
-function relSec(i) {
+function frameUrl(i) {
+  return `/clips/${S.review.clip.id}/frames/${S.review.frames[i].f}`;
+}
+
+function getFrameImage(i) {
   const R = S.review;
-  return (R.frames[i].t - R.frames[0].t) / 1000;
+  if (!R.images.has(i)) {
+    const p = loadImage(frameUrl(i));
+    p.catch(() => R.images.delete(i));
+    R.images.set(i, p);
+    // 長時間的測試有幾千格，只留最近用到的
+    if (R.images.size > 400) R.images.delete(R.images.keys().next().value);
+  }
+  return R.images.get(i);
 }
 
 function updateTimeLabel() {
   const R = S.review;
   if (!R.frames.length) return;
   const total = relSec(R.frames.length - 1);
-  $('#tlTime').textContent = `${relSec(R.index).toFixed(1)} / ${total.toFixed(1)} 秒　第 ${R.index + 1}/${R.frames.length} 格`;
+  $('#tlTime').textContent = `${fmtRel(relSec(R.index))} / ${fmtRel(total)}　第 ${R.index + 1}/${R.frames.length} 格`;
 }
 
 function setupTimeline() {
@@ -512,32 +650,208 @@ function setupTimeline() {
   slider.max = Math.max(0, n - 1);
   slider.value = R.index;
   const pct = (i) => (n > 1 ? (i / (n - 1)) * 100 : 0);
-  const mark = $('#tlMark');
-  mark.hidden = R.clip.kind !== 'mark';
-  mark.style.left = `${pct(R.clip.kind === 'mark' ? markIndexOf(R.clip) : 0)}%`;
-  const anc = $('#tlAnchor');
-  anc.hidden = R.anchor == null;
-  if (R.anchor != null) anc.style.left = `${pct(R.anchor)}%`;
+  let ticks = R.markers.map((m, k) => `<span class="tick marker" style="left:${pct(frameIndexAt(m.t))}%" title="書籤 ${k + 1}"></span>`).join('');
+  ticks += liveDrafts()
+    .filter(draftHasContent)
+    .map((d) => `<span class="tick draft ${d.noteId ? 'sent' : ''}" style="left:${pct(indexOfFile(d.f))}%"></span>`)
+    .join('');
+  $('#tlTicks').innerHTML = ticks;
+  const a = activeDraft() || liveDrafts().find((x) => x.id === R.rangeTargetId);
   const range = $('#tlRange');
-  const hasRange = R.rangeIn != null && R.rangeOut != null;
-  range.hidden = !hasRange;
-  $('#btnRangeClear').hidden = R.rangeIn == null && R.rangeOut == null;
-  if (hasRange) {
-    range.style.left = `${pct(R.rangeIn)}%`;
-    range.style.width = `${pct(R.rangeOut) - pct(R.rangeIn)}%`;
+  const r = a?.range;
+  range.hidden = !(r && r.startT != null && r.endT != null);
+  $('#btnRangeClear').hidden = !r;
+  if (!range.hidden) {
+    const si = frameIndexAt(r.startT), ei = frameIndexAt(r.endT);
+    range.style.left = `${pct(si)}%`;
+    range.style.width = `${pct(ei) - pct(si)}%`;
   }
   let info = '';
-  if (R.rangeIn != null && R.rangeOut == null) info = `區間起點：${relSec(R.rangeIn).toFixed(1)} 秒（再按「終點」）`;
-  if (hasRange) info = `已選區間：${relSec(R.rangeIn).toFixed(1)}–${relSec(R.rangeOut).toFixed(1)} 秒，連續畫面會從這段取`;
+  if (r && r.startT != null && r.endT == null) info = `區間起點：${fmtRel(relSec(frameIndexAt(r.startT)))}（再按「終點」）`;
+  if (r && r.startT != null && r.endT != null) info = `已選區間 ${fmtRel(relSec(frameIndexAt(r.startT)))}–${fmtRel(relSec(frameIndexAt(r.endT)))}，連續畫面會從這段取`;
+  if (info && a && a.f !== R.frames[R.index]?.f) info += `（套用在 ${fmtRel(relSec(indexOfFile(a.f)))} 那一筆）`;
   $('#rangeInfo').textContent = info;
 }
+
+// ---------- 右側：書籤與草稿清單 ----------
+
+function buildItems() {
+  const R = S.review;
+  const items = [];
+  const used = new Set();
+  R.markers.forEach((m, k) => {
+    const idx = frameIndexAt(m.t);
+    const d = liveDrafts().find((x) => x.markerT === m.t) || draftAtIndex(idx);
+    if (d) used.add(d.id);
+    items.push({ t: R.frames[idx]?.t ?? m.t, idx, marker: k + 1, markerT: m.t, draft: d });
+  });
+  for (const d of liveDrafts()) {
+    if (used.has(d.id) || !draftHasContent(d)) continue;
+    items.push({ t: d.t, idx: indexOfFile(d.f), marker: null, draft: d });
+  }
+  items.sort((a, b) => a.t - b.t);
+  return items;
+}
+
+function renderItems() {
+  const R = S.review;
+  if (!R) return;
+  const items = buildItems();
+  const pending = liveDrafts().filter((d) => !d.noteId && draftHasContent(d)).length;
+  const sent = liveDrafts().filter((d) => d.noteId).length;
+  $('#itemsCount').textContent = `${R.markers.length} 個書籤${pending ? `，${pending} 筆待送出` : ''}${sent ? `，${sent} 筆已送出` : ''}`;
+  const btn = $('#btnSubmitAll');
+  btn.disabled = !pending;
+  btn.textContent = pending ? `全部送出（${pending} 筆）` : '全部送出';
+  if (!items.length) {
+    $('#items').innerHTML = '<li class="empty-item">這場還沒有書籤。拖時間軸找到有問題的畫面，直接在上面畫或在下面寫說明，就會變成一筆。</li>';
+    return;
+  }
+  $('#items').innerHTML = items
+    .map((it) => {
+      const d = it.draft;
+      let state = 'none', text = '還沒寫';
+      if (d?.noteId) {
+        state = 'sent';
+        text = `已送出 #${d.number}　${esc(d.description.split('\n')[0] || '')}`;
+      } else if (d && draftHasContent(d)) {
+        state = 'draft';
+        text = d.description.trim() ? esc(d.description.split('\n')[0]) : '已框選，還沒寫說明';
+      }
+      const current = it.idx === R.index || (d && d.id === R.activeId);
+      return `<li class="item ${current ? 'on' : ''}" data-idx="${it.idx}">
+        <img src="/clips/${R.clip.id}/frames/${R.frames[it.idx].f}" alt="" loading="lazy">
+        <div class="item-body">
+          <div class="item-top"><span class="dot ${state}"></span>${fmtRel(relSec(it.idx))}${it.marker ? `<span class="item-tag">書籤 ${it.marker}</span>` : ''}</div>
+          <div class="item-text">${text}</div>
+        </div>
+        ${it.marker && !d ? `<button class="ghost item-x" data-delmarker="${it.markerT}" title="刪掉這個書籤">✕</button>` : ''}
+      </li>`;
+    })
+    .join('');
+  const on = $('#items .item.on');
+  if (on) on.scrollIntoView({ block: 'nearest' });
+}
+
+$('#items').addEventListener('click', async (e) => {
+  const x = e.target.closest('[data-delmarker]');
+  const R = S.review;
+  if (x) {
+    e.stopPropagation();
+    const t = Number(x.dataset.delmarker);
+    R.markers = R.markers.filter((m) => m.t !== t);
+    try {
+      await api('PATCH', `/api/clips/${R.clip.id}`, { markers: R.markers });
+    } catch (err) {
+      toast(err.message, true);
+    }
+    renderItems();
+    setupTimeline();
+    return;
+  }
+  const li = e.target.closest('.item[data-idx]');
+  if (!li) return;
+  stopPlayback();
+  R.userMoved = true;
+  showFrame(Number(li.dataset.idx));
+});
+
+function renderEditor() {
+  const R = S.review;
+  const d = activeDraft();
+  const ta = $('#fDesc');
+  const title = $('#editorTitle');
+  const del = $('#btnDelDraft');
+  if (d) {
+    const idx = indexOfFile(d.f);
+    const m = R.markers.findIndex((x) => x.t === d.markerT);
+    if (d.noteId) {
+      title.innerHTML = `${fmtRel(relSec(idx))} 這一筆已送出成 <a href="#note/${d.noteId}">回報 #${d.number}</a>`;
+    } else {
+      title.textContent = `${fmtRel(relSec(idx))} 這一筆${m >= 0 ? `（書籤 ${m + 1}）` : ''}`;
+    }
+    if (document.activeElement !== ta) ta.value = d.description;
+    ta.disabled = !!d.noteId;
+    del.hidden = !!d.noteId;
+  } else {
+    const m = markerAtIndex(R.index);
+    const k = m ? R.markers.indexOf(m) + 1 : 0;
+    title.textContent = `${fmtRel(relSec(R.index))}${k ? `（書籤 ${k}）` : ''}：在畫面上畫標註，或在這裡寫說明`;
+    if (document.activeElement !== ta) ta.value = '';
+    ta.disabled = false;
+    del.hidden = true;
+  }
+  $('#anchorHint').hidden = true;
+}
+
+function nextItem(dir = 1) {
+  const R = S.review;
+  const items = buildItems();
+  if (!items.length) return;
+  const cur = R.frames[R.index].t;
+  const target = dir > 0 ? items.find((it) => it.t > cur) : [...items].reverse().find((it) => it.t < cur);
+  if (!target) return toast(dir > 0 ? '已經是最後一個了' : '已經是第一個了', false, 1200);
+  stopPlayback();
+  R.userMoved = true;
+  showFrame(target.idx);
+}
+
+// ---------- 草稿存檔 ----------
+
+function scheduleSave() {
+  const R = S.review;
+  if (!R) return;
+  clearTimeout(R.saveTimer);
+  R.saveTimer = setTimeout(() => saveDrafts(R), 500);
+  renderItems();
+  setupTimeline();
+}
+
+function serializeDrafts(R) {
+  return R.drafts.filter((d) => !d.removed && (d.noteId || draftHasContent(d)));
+}
+
+async function saveDrafts(R) {
+  clearTimeout(R.saveTimer);
+  R.saveTimer = null;
+  try {
+    await api('PUT', `/api/clips/${R.clip.id}/drafts`, serializeDrafts(R));
+  } catch (e) {
+    toast(`草稿沒存到：${e.message}`, true);
+  }
+}
+
+function flushSave() {
+  const R = S.review;
+  if (R && R.saveTimer) saveDrafts(R);
+}
+
+window.addEventListener('beforeunload', () => {
+  const R = S.review;
+  if (R && R.saveTimer) {
+    fetch(`/api/clips/${R.clip.id}/drafts`, {
+      method: 'PUT',
+      keepalive: true,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(serializeDrafts(R)),
+    });
+  }
+});
+
+// ---------- 播放 ----------
 
 function stopPlayback() {
   const R = S.review;
   if (!R) return;
+  const was = R.playing;
   R.playing = false;
   clearTimeout(R.playTimer);
   $('#btnPlay').textContent = '▶';
+  if (was) {
+    renderEditor();
+    renderItems();
+    setupTimeline();
+  }
 }
 
 function togglePlay() {
@@ -560,7 +874,6 @@ function togglePlay() {
   };
   step();
 }
-
 // ---------- 標註繪製 ----------
 
 function lineW() {
@@ -643,32 +956,31 @@ function annBox(a, W, H, c = ctx) {
   return { x: 0, y: 0, w: 0, h: 0 };
 }
 
+
 function drawReview() {
   const R = S.review;
   if (!R || !R.currentImage) return;
   const W = canvas.width, H = canvas.height;
   ctx.clearRect(0, 0, W, H);
   ctx.drawImage(R.currentImage, 0, 0, W, H);
-  const onAnchor = R.anchor == null || R.anchor === R.index;
-  if (onAnchor) {
-    R.annotations.forEach((a) => drawAnnotation(ctx, a, W, H, lineW()));
-    if (R.drawing) drawAnnotation(ctx, R.drawing, W, H, lineW());
-    if (R.selected >= 0 && R.annotations[R.selected]) {
-      const b = annBox(R.annotations[R.selected], W, H);
-      ctx.save();
-      ctx.setLineDash([8, 6]);
-      ctx.strokeStyle = '#0a84ff';
-      ctx.lineWidth = 2;
-      const pad = lineW() + 6;
-      ctx.strokeRect(b.x - pad, b.y - pad, b.w + pad * 2, b.h + pad * 2);
-      ctx.restore();
-    }
+  const d = draftAtIndex(R.index);
+  if (d) {
+    ctx.save();
+    if (d.noteId) ctx.globalAlpha = 0.6;
+    d.annotations.forEach((a) => drawAnnotation(ctx, a, W, H, lineW()));
+    ctx.restore();
   }
-  $('#anchorHint').hidden = onAnchor;
-  if (!onAnchor) $('#anchorTime').textContent = relSec(R.anchor).toFixed(1);
-  const anc = $('#tlAnchor');
-  anc.hidden = R.anchor == null;
-  if (R.anchor != null) anc.style.left = `${R.frames.length > 1 ? (R.anchor / (R.frames.length - 1)) * 100 : 0}%`;
+  if (R.drawing) drawAnnotation(ctx, R.drawing, W, H, lineW());
+  if (d && R.selected >= 0 && d.annotations[R.selected]) {
+    const b = annBox(d.annotations[R.selected], W, H);
+    ctx.save();
+    ctx.setLineDash([8, 6]);
+    ctx.strokeStyle = '#0a84ff';
+    ctx.lineWidth = 2;
+    const pad = lineW() + 6;
+    ctx.strokeRect(b.x - pad, b.y - pad, b.w + pad * 2, b.h + pad * 2);
+    ctx.restore();
+  }
 }
 
 function pointerPos(e) {
@@ -676,28 +988,46 @@ function pointerPos(e) {
   return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
 }
 
-function pushUndo() {
+function pushUndo(d) {
   const R = S.review;
-  R.undo.push(JSON.stringify({ a: R.annotations, anchor: R.anchor }));
-  if (R.undo.length > 100) R.undo.shift();
+  R.undo.push({ id: d.id, a: JSON.stringify(d.annotations) });
+  if (R.undo.length > 150) R.undo.shift();
 }
 
 function doUndo() {
   const R = S.review;
   if (!R || !R.undo.length) return;
-  const s = JSON.parse(R.undo.pop());
-  R.annotations = s.a;
-  R.anchor = s.anchor;
+  const u = R.undo.pop();
+  const d = R.drafts.find((x) => x.id === u.id);
+  if (!d || d.noteId) return;
+  d.annotations = JSON.parse(u.a);
+  d.removed = false;
   R.selected = -1;
-  drawReview();
+  showFrame(indexOfFile(d.f));
+  scheduleSave();
+}
+
+// 這一格要畫的那筆草稿（沒有就建一筆）
+function targetDraft() {
+  const R = S.review;
+  let d = draftAtIndex(R.index);
+  if (d?.noteId) {
+    toast(`這一格已經送出成回報 #${d.number}，要改請到回報頁`, true);
+    return null;
+  }
+  if (!d) d = createDraftAt(R.index);
+  R.activeId = d.id;
+  return d;
 }
 
 function hitTest(p) {
   const R = S.review;
+  const d = draftAtIndex(R.index);
+  if (!d || d.noteId) return -1;
   const W = canvas.width, H = canvas.height;
   const tol = Math.max(14, lineW() * 3);
-  for (let i = R.annotations.length - 1; i >= 0; i--) {
-    const b = annBox(R.annotations[i], W, H);
+  for (let i = d.annotations.length - 1; i >= 0; i--) {
+    const b = annBox(d.annotations[i], W, H);
     const px = p.x * W, py = p.y * H;
     if (px >= b.x - tol && px <= b.x + b.w + tol && py >= b.y - tol && py <= b.y + b.h + tol) return i;
   }
@@ -715,31 +1045,23 @@ function moveAnnotation(a, dx, dy) {
   if (a.type === 'pen') a.pts = a.pts.map(([x, y]) => [x + dx, y + dy]);
 }
 
-function ensureAnchor() {
-  const R = S.review;
-  if (R.anchor != null && R.anchor !== R.index) {
-    // 換到另一格再畫：把之前的標註搬過來，標註永遠只在同一格
-    if (R.annotations.length && !confirm(`之前的標註畫在第 ${relSec(R.anchor).toFixed(1)} 秒那一格。要把標註移到現在這一格嗎？`)) return false;
-  }
-  R.anchor = R.index;
-  return true;
-}
-
 canvas.addEventListener('pointerdown', (e) => {
   const R = S.review;
   if (!R || !R.currentImage || e.button !== 0) return;
   stopPlayback();
-  hideTextInput();
+  hideTextInput(true);
   const p = pointerPos(e);
   if (S.tool === 'select') {
-    if (R.anchor != null && R.anchor !== R.index) return;
     R.selected = hitTest(p);
-    if (R.selected >= 0) {
-      pushUndo();
+    const d = draftAtIndex(R.index);
+    if (R.selected >= 0 && d) {
+      R.activeId = d.id;
+      pushUndo(d);
       R.dragFrom = p;
       canvas.setPointerCapture(e.pointerId);
     }
     drawReview();
+    renderEditor();
     return;
   }
   if (S.tool === 'text') {
@@ -747,13 +1069,15 @@ canvas.addEventListener('pointerdown', (e) => {
     showTextInput(e, p);
     return;
   }
-  if (!ensureAnchor()) return;
+  const d = targetDraft();
+  if (!d) return;
   canvas.setPointerCapture(e.pointerId);
   R.selected = -1;
   const c = S.color;
   if (S.tool === 'rect' || S.tool === 'ellipse') R.drawing = { type: S.tool, color: c, x: p.x, y: p.y, w: 0, h: 0, _x0: p.x, _y0: p.y };
   else if (S.tool === 'arrow') R.drawing = { type: 'arrow', color: c, x1: p.x, y1: p.y, x2: p.x, y2: p.y };
   else if (S.tool === 'pen') R.drawing = { type: 'pen', color: c, pts: [[p.x, p.y]] };
+  renderEditor();
   drawReview();
 });
 
@@ -762,7 +1086,8 @@ canvas.addEventListener('pointermove', (e) => {
   if (!R) return;
   const p = pointerPos(e);
   if (S.tool === 'select' && R.dragFrom && R.selected >= 0) {
-    moveAnnotation(R.annotations[R.selected], p.x - R.dragFrom.x, p.y - R.dragFrom.y);
+    const d = draftAtIndex(R.index);
+    if (d) moveAnnotation(d.annotations[R.selected], p.x - R.dragFrom.x, p.y - R.dragFrom.y);
     R.dragFrom = p;
     drawReview();
     return;
@@ -794,46 +1119,49 @@ function endPointer() {
   if (!R) return;
   if (R.dragFrom) {
     R.dragFrom = null;
+    scheduleSave();
     return;
   }
-  const d = R.drawing;
-  if (!d) return;
+  const a = R.drawing;
+  if (!a) return;
   R.drawing = null;
   const W = canvas.width, H = canvas.height;
   let ok = true;
-  if (d.type === 'rect' || d.type === 'ellipse') ok = d.w * W > 6 && d.h * H > 6;
-  if (d.type === 'arrow') ok = Math.hypot((d.x2 - d.x1) * W, (d.y2 - d.y1) * H) > 12;
-  if (d.type === 'pen') {
-    ok = d.pts.length > 2;
-    const b = annBox(d, W, H);
-    d.bx = b.x / W;
-    d.by = b.y / H;
+  if (a.type === 'rect' || a.type === 'ellipse') ok = a.w * W > 6 && a.h * H > 6;
+  if (a.type === 'arrow') ok = Math.hypot((a.x2 - a.x1) * W, (a.y2 - a.y1) * H) > 12;
+  if (a.type === 'pen') {
+    ok = a.pts.length > 2;
+    const b = annBox(a, W, H);
+    a.bx = b.x / W;
+    a.by = b.y / H;
   }
-  delete d._x0;
-  delete d._y0;
-  if (ok) {
-    pushUndo();
-    R.annotations.push(d);
+  delete a._x0;
+  delete a._y0;
+  const d = draftAtIndex(R.index);
+  if (ok && d) {
+    pushUndo(d);
+    d.annotations.push(a);
+    scheduleSave();
   }
-  if (!R.annotations.length) R.anchor = null;
   drawReview();
+  renderEditor();
 }
 canvas.addEventListener('pointerup', endPointer);
 canvas.addEventListener('pointercancel', endPointer);
 
 let textPos = null;
 function showTextInput(e, p) {
-  const R = S.review;
-  if (!ensureAnchor()) return;
+  const d = targetDraft();
+  if (!d) return;
   const input = $('#textInput');
   const stage = $('#reviewStage').getBoundingClientRect();
   input.style.left = `${e.clientX - stage.left}px`;
   input.style.top = `${e.clientY - stage.top - 14}px`;
   input.value = '';
   input.hidden = false;
-  textPos = p;
+  textPos = { ...p, draftId: d.id };
   setTimeout(() => input.focus(), 0);
-  if (!R.annotations.length) R.anchor = R.index;
+  renderEditor();
 }
 
 function hideTextInput(commit = false) {
@@ -842,11 +1170,12 @@ function hideTextInput(commit = false) {
   const R = S.review;
   const text = input.value.trim();
   input.hidden = true;
-  if (commit && text && textPos) {
-    pushUndo();
-    R.annotations.push({ type: 'text', color: S.color, x: textPos.x, y: textPos.y, text });
+  const d = textPos && R.drafts.find((x) => x.id === textPos.draftId);
+  if (commit && text && d) {
+    pushUndo(d);
+    d.annotations.push({ type: 'text', color: S.color, x: textPos.x, y: textPos.y, text });
+    scheduleSave();
   }
-  if (!R.annotations.length) R.anchor = null;
   textPos = null;
   drawReview();
 }
@@ -859,6 +1188,43 @@ $('#textInput').addEventListener('keydown', (e) => {
   e.stopPropagation();
 });
 $('#textInput').addEventListener('blur', () => hideTextInput(true));
+
+// 說明欄：打字就存進目前這筆（沒有就在這一格建一筆）
+$('#fDesc').addEventListener('input', (e) => {
+  const R = S.review;
+  if (!R) return;
+  let d = activeDraft();
+  if (!d) {
+    d = draftAtIndex(R.index) || createDraftAt(R.index);
+    R.activeId = d.id;
+  }
+  if (d.noteId) return;
+  d.description = e.target.value;
+  scheduleSave();
+  renderEditor();
+});
+$('#fDesc').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    e.target.blur();
+    nextItem(1);
+  }
+});
+
+$('#btnDelDraft').onclick = () => {
+  const R = S.review;
+  const d = activeDraft();
+  if (!d || d.noteId) return;
+  if (draftHasContent(d) && !confirm('刪掉這一筆的標註和說明？')) return;
+  pushUndo(d);
+  d.removed = true;
+  R.activeId = null;
+  $('#fDesc').value = '';
+  scheduleSave();
+  renderEditor();
+  drawReview();
+};
+$('#btnNextItem').onclick = () => nextItem(1);
 
 function setTool(t) {
   S.tool = t;
@@ -876,9 +1242,11 @@ function setColor(c) {
   localStorage.setItem('cc.color', c);
   for (const b of $$('#colors [data-color]')) b.classList.toggle('on', b.dataset.color === c);
   const R = S.review;
-  if (R && R.selected >= 0 && R.annotations[R.selected]) {
-    pushUndo();
-    R.annotations[R.selected].color = c;
+  const d = R && draftAtIndex(R.index);
+  if (d && !d.noteId && R.selected >= 0 && d.annotations[R.selected]) {
+    pushUndo(d);
+    d.annotations[R.selected].color = c;
+    scheduleSave();
     drawReview();
   }
 }
@@ -892,55 +1260,80 @@ $('#tools').addEventListener('click', (e) => {
 $('#btnUndo').onclick = doUndo;
 $('#btnClear').onclick = () => {
   const R = S.review;
-  if (!R || !R.annotations.length) return;
-  pushUndo();
-  R.annotations = [];
-  R.anchor = null;
+  const d = R && draftAtIndex(R.index);
+  if (!d || d.noteId || !d.annotations.length) return;
+  pushUndo(d);
+  d.annotations = [];
   R.selected = -1;
+  scheduleSave();
   drawReview();
 };
 
-$('#tlSlider').addEventListener('input', (e) => {
+function moveTo(i) {
   stopPlayback();
   S.review.userMoved = true;
-  showFrame(Number(e.target.value));
-});
-$('#btnFirst').onclick = () => (stopPlayback(), (S.review.userMoved = true), showFrame(0));
-$('#btnLast').onclick = () => (stopPlayback(), (S.review.userMoved = true), showFrame(S.review.frames.length - 1));
-$('#btnPrev').onclick = () => (stopPlayback(), (S.review.userMoved = true), showFrame(S.review.index - 1));
-$('#btnNext').onclick = () => (stopPlayback(), (S.review.userMoved = true), showFrame(S.review.index + 1));
+  showFrame(i);
+}
+$('#tlSlider').addEventListener('input', (e) => moveTo(Number(e.target.value)));
+$('#btnFirst').onclick = () => moveTo(0);
+$('#btnLast').onclick = () => moveTo(S.review.frames.length - 1);
+$('#btnPrev').onclick = () => moveTo(S.review.index - 1);
+$('#btnNext').onclick = () => moveTo(S.review.index + 1);
 $('#btnPlay').onclick = togglePlay;
-$('#btnGoAnchor').onclick = () => S.review?.anchor != null && showFrame(S.review.anchor);
+$('#btnGoAnchor').onclick = () => {
+  const d = activeDraft();
+  if (d) moveTo(indexOfFile(d.f));
+};
 
-function setRangeIn() {
+// 區間：屬於目前這格的那一筆；這格沒有的話，套用到最後編輯的那一筆
+function rangeDraft() {
   const R = S.review;
-  R.rangeIn = R.index;
-  if (R.rangeOut != null && R.rangeOut < R.rangeIn) R.rangeOut = null;
-  setupTimeline();
+  let d = activeDraft() || liveDrafts().find((x) => x.id === R.rangeTargetId && !x.noteId);
+  if (!d) {
+    d = draftAtIndex(R.index) || createDraftAt(R.index);
+    R.activeId = d.id;
+  }
+  return d.noteId ? null : d;
+}
+function setRangeIn() {
+  const d = rangeDraft();
+  if (!d) return;
+  const t = S.review.frames[S.review.index].t;
+  d.range = { startT: t, endT: d.range?.endT != null && d.range.endT > t ? d.range.endT : null };
+  scheduleSave();
+  renderEditor();
 }
 function setRangeOut() {
-  const R = S.review;
-  if (R.rangeIn == null) R.rangeIn = 0;
-  if (R.index <= R.rangeIn) return toast('終點要在起點後面', true);
-  R.rangeOut = R.index;
-  setupTimeline();
+  const d = rangeDraft();
+  if (!d) return;
+  const t = S.review.frames[S.review.index].t;
+  const start = d.range?.startT ?? S.review.frames[0].t;
+  if (t <= start) return toast('終點要在起點後面', true);
+  d.range = { startT: start, endT: t };
+  scheduleSave();
+  renderEditor();
 }
 $('#btnRangeIn').onclick = setRangeIn;
 $('#btnRangeOut').onclick = setRangeOut;
 $('#btnRangeClear').onclick = () => {
-  S.review.rangeIn = S.review.rangeOut = null;
-  setupTimeline();
+  const d = activeDraft() || liveDrafts().find((x) => x.id === S.review.rangeTargetId);
+  if (!d || d.noteId) return;
+  d.range = null;
+  scheduleSave();
 };
 
-function setSeverity(v) {
-  if (S.review) S.review.severity = v;
-  for (const b of $$('#fSeverity button')) b.classList.toggle('on', b.dataset.v === v);
-}
-$('#fSeverity').addEventListener('click', (e) => {
-  const b = e.target.closest('button');
-  if (b) setSeverity(b.dataset.v);
+$('#sessProject').addEventListener('change', async (e) => {
+  const R = S.review;
+  try {
+    R.clip = { ...R.clip, ...(await api('PATCH', `/api/clips/${R.clip.id}`, { project: e.target.value })), frames: R.frames };
+    S.config.lastProject = e.target.value;
+    toast(`這場測試算「${e.target.value || '未分類'}」的`);
+  } catch (err) {
+    toast(err.message, true);
+  }
 });
-
+$('#btnStopFromReview').onclick = toggleSession;
+$('#btnReviewNow').onclick = () => S.session && (location.hash = `#review/${S.session.id}`);
 // ---------- 產生回報圖片 ----------
 
 function renderAnnotated(img, annotations) {
@@ -986,15 +1379,16 @@ function cropAround(full, annotations) {
   return c;
 }
 
-async function buildSequence(R, anchorIdx) {
+
+async function buildSequence(R, anchorIdx, range) {
   let idxs = [];
-  if (R.rangeIn != null && R.rangeOut != null) {
-    for (let i = R.rangeIn; i <= R.rangeOut; i++) idxs.push(i);
+  if (range && range.startT != null && range.endT != null) {
+    for (let i = frameIndexAt(range.startT); i <= frameIndexAt(range.endT); i++) idxs.push(i);
   } else {
     const t = R.frames[anchorIdx].t;
-    R.frames.forEach((f, i) => {
-      if (Math.abs(f.t - t) <= 1500) idxs.push(i);
-    });
+    // 往前後找，畫面沒變動時格子很稀，最多往外找 3 秒
+    for (let i = anchorIdx; i >= 0 && t - R.frames[i].t <= 1500; i--) idxs.unshift(i);
+    for (let i = anchorIdx + 1; i < R.frames.length && R.frames[i].t - t <= 1500; i++) idxs.push(i);
   }
   if (idxs.length < 2) return null;
   const MAX = 8;
@@ -1002,7 +1396,6 @@ async function buildSequence(R, anchorIdx) {
   if (idxs.length > MAX) {
     pick = [];
     for (let k = 0; k < MAX; k++) pick.push(idxs[Math.round((k * (idxs.length - 1)) / (MAX - 1))]);
-    // 標註那格一定要在裡面
     if (idxs.includes(anchorIdx) && !pick.includes(anchorIdx)) {
       let near = 0;
       pick.forEach((p, k) => (Math.abs(p - anchorIdx) < Math.abs(pick[near] - anchorIdx) ? (near = k) : 0));
@@ -1034,109 +1427,108 @@ async function buildSequence(R, anchorIdx) {
     g.fillStyle = fi === anchorIdx ? '#ff3b30' : '#333333';
     g.font = 'bold 15px "Microsoft JhengHei UI","PingFang TC",sans-serif';
     g.textBaseline = 'top';
-    g.fillText(fi === anchorIdx ? `標註這格（${relSec(fi).toFixed(1)}s）` : `${dt >= 0 ? '+' : ''}${dt.toFixed(2)} 秒`, x, y + th + 5);
+    g.fillText(fi === anchorIdx ? `標註這格（${fmtRel(relSec(fi))}）` : `${dt >= 0 ? '+' : ''}${dt.toFixed(2)} 秒`, x, y + th + 5);
   });
   return c;
 }
 
-async function submitNote() {
+async function submitAll() {
   const R = S.review;
   if (!R) return;
   hideTextInput(true);
-  const description = $('#fDesc').value.trim();
-  if (!description && !R.annotations.length) return toast('請至少畫一個標註，或寫一句說明', true);
-  const btn = $('#btnSubmit');
+  const pending = liveDrafts()
+    .filter((d) => !d.noteId && draftHasContent(d))
+    .sort((a, b) => a.t - b.t);
+  if (!pending.length) return toast('還沒有要送出的回報', true);
+  const empty = buildItems().filter((it) => it.marker && !(it.draft && draftHasContent(it.draft))).length;
+  if (empty && !confirm(`還有 ${empty} 個書籤沒寫。先把寫好的 ${pending.length} 筆送出？（沒寫的書籤會留著，之後可以再補）`)) return;
+  const noDesc = pending.filter((d) => !d.description.trim()).length;
+  if (noDesc && !confirm(`有 ${noDesc} 筆只有框選、沒寫說明。Claude 只能看圖猜，確定要送出嗎？`)) return;
+
+  const btn = $('#btnSubmitAll');
   btn.disabled = true;
-  btn.textContent = '產生圖片中…';
+  const sent = [];
   try {
-    const idx = R.anchor ?? R.index;
-    const img = await getFrameImage(idx);
-    const full = renderAnnotated(img, R.annotations);
-    const crop = cropAround(full, R.annotations);
-    const seq = await buildSequence(R, idx);
-    const project = $('#fProject').value;
-    localStorage.setItem('cc.lastProject', project);
-    const hasRange = R.rangeIn != null && R.rangeOut != null;
-    const res = await api('POST', '/api/notes', {
-      clipId: R.clip.id,
-      frameFile: R.frames[idx].f,
-      frameTime: relSec(idx),
-      range: hasRange ? { start: relSec(R.rangeIn), end: relSec(R.rangeOut) } : null,
-      frameSize: { w: img.naturalWidth, h: img.naturalHeight },
-      annotations: R.annotations,
-      description,
-      title: $('#fTitle').value.trim(),
-      project,
-      severity: R.severity,
-      images: {
-        full: full.toDataURL('image/png'),
-        crop: crop ? crop.toDataURL('image/png') : null,
-        sequence: seq ? seq.toDataURL('image/jpeg', 0.86) : null,
-      },
-    });
-    R.submitted = res.note;
-    R.prompt = res.prompt;
-    showDone(res.note);
-    refreshBadge();
+    for (const [k, d] of pending.entries()) {
+      btn.textContent = `送出中 ${k + 1}/${pending.length}…`;
+      const idx = indexOfFile(d.f);
+      const img = await getFrameImage(idx);
+      const full = renderAnnotated(img, d.annotations);
+      const crop = cropAround(full, d.annotations);
+      const seq = await buildSequence(R, idx, d.range);
+      const hasRange = d.range && d.range.startT != null && d.range.endT != null;
+      const res = await api('POST', '/api/notes', {
+        clipId: R.clip.id,
+        frameFile: d.f,
+        frameTime: relSec(idx),
+        range: hasRange ? { start: relSec(frameIndexAt(d.range.startT)), end: relSec(frameIndexAt(d.range.endT)) } : null,
+        frameSize: { w: img.naturalWidth, h: img.naturalHeight },
+        annotations: d.annotations,
+        description: d.description.trim(),
+        project: R.clip.project || '',
+        quiet: true,
+        images: {
+          full: full.toDataURL('image/png'),
+          crop: crop ? crop.toDataURL('image/png') : null,
+          sequence: seq ? seq.toDataURL('image/jpeg', 0.86) : null,
+        },
+      });
+      d.noteId = res.note.id;
+      d.number = res.note.number;
+      sent.push(res.note);
+      await saveDrafts(R);
+    }
   } catch (e) {
-    toast(`送出失敗：${e.message}`, true);
+    toast(`送到第 ${sent.length + 1} 筆時失敗：${e.message}。已送出的不會重複送，再按一次會接著送。`, true, 6000);
   } finally {
     btn.disabled = false;
-    btn.textContent = '送出回報';
+    api('POST', '/api/notify').catch(() => {});
+    refreshBadge();
+    renderItems();
+    renderEditor();
+    setupTimeline();
+    drawReview();
   }
+  if (sent.length) showDone(sent);
 }
 
+$('#btnSubmitAll').onclick = submitAll;
+
 function showForm() {
-  $('#formMode').hidden = false;
+  for (const id of ['#editor', '#items', '.items-head', '.submit-bar', '.sess-head']) $(id).hidden = false;
   $('#formDone').hidden = true;
 }
 
-function showDone(note) {
-  $('#formMode').hidden = true;
+async function showDone(sent) {
+  const R = S.review;
+  for (const id of ['#editor', '#items', '.items-head', '.submit-bar']) $(id).hidden = true;
   $('#formDone').hidden = false;
-  $('#doneTitle').textContent = `已建立回報 #${note.number}`;
-  $('#doneSub').textContent = `${note.project || '未分類'}・${note.title}`;
-  const proj = projectByName(note.project);
+  const nums = sent.map((n) => n.number);
+  $('#doneTitle').textContent = `已送出 ${sent.length} 筆回報`;
+  $('#doneSub').textContent = `${R.clip.project || '未分類'}・#${Math.min(...nums)}${nums.length > 1 ? `–#${Math.max(...nums)}` : ''}`;
+  const proj = projectByName(R.clip.project);
   $('#btnLaunch').hidden = !(proj && proj.localPath && S.state?.platform === 'win32');
+  try {
+    R.prompt = (await api('GET', `/api/notes/prompt-all?session=${encodeURIComponent(R.clip.id)}`)).prompt;
+  } catch {
+    R.prompt = '請用芹查的 MCP 工具處理所有待修回報。';
+  }
 }
 
-$('#btnSubmit').onclick = submitNote;
 $('#btnCopyPrompt').onclick = async () => {
   await copyText(S.review.prompt);
-  toast('已複製，貼到 Claude Code 就會開始處理');
+  toast('已複製，貼到 Claude Code 就會逐筆處理');
 };
 $('#btnLaunch').onclick = async () => {
   try {
-    await api('POST', `/api/notes/${S.review.submitted.id}/launch`);
+    await api('POST', '/api/notes/launch-all', { project: S.review.clip.project, session: S.review.clip.id });
     toast('已開啟 Claude Code 視窗');
   } catch (e) {
     toast(e.message, true);
   }
 };
-$('#btnAnother').onclick = () => {
-  const R = S.review;
-  R.annotations = [];
-  R.undo = [];
-  R.anchor = null;
-  R.selected = -1;
-  R.rangeIn = R.rangeOut = null;
-  R.submitted = null;
-  $('#fDesc').value = '';
-  $('#fTitle').value = '';
-  setSeverity('中');
-  setupTimeline();
-  showForm();
-  drawReview();
-  $('#fDesc').focus();
-};
+$('#btnKeepEditing').onclick = showForm;
 $('#btnBackLive').onclick = () => (location.hash = '#live');
-$('#fDesc').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-    e.preventDefault();
-    submitNote();
-  }
-});
-
 // ---------------------------------------------------------------------------
 // 回報清單
 // ---------------------------------------------------------------------------
@@ -1169,7 +1561,7 @@ async function renderNotes() {
           <div class="note-tags">
             <span class="tag st-${n.status}">${STATUS_LABEL[n.status]}</span>
             <span class="tag">${esc(n.project || '未分類')}</span>
-            <span class="tag">嚴重度 ${esc(n.severity)}</span>
+            ${n.sessionNumber ? `<span class="tag">第 ${n.sessionNumber} 場</span>` : ''}
           </div>
         </div>
       </div>`;
@@ -1282,7 +1674,7 @@ async function renderNotePage(id) {
           <span class="tag">#${note.number}</span>
           <span class="tag st-${note.status}">${STATUS_LABEL[note.status]}</span>
           <span class="tag">${esc(note.project || '未分類')}</span>
-          <span class="tag">嚴重度 ${esc(note.severity)}</span>
+          ${note.sessionNumber ? `<a class="tag" href="#review/${note.clipId}">第 ${note.sessionNumber} 場測試</a>` : ''}
           <span class="tag">${fmtTime(note.createdAt)}</span>
         </div>
         <h1>${esc(note.title)}</h1>
@@ -1315,7 +1707,7 @@ async function renderNotePage(id) {
           <h2>處理紀錄</h2>
           <ul class="history">${history}</ul>
         </div>
-        ${note.clipId ? `<p class="muted small">來源片段：<a href="#review/${note.clipId}">${note.clipId}</a>（片段可能已被自動清掉）</p>` : ''}
+        ${note.clipId ? `<p class="muted small">來自<a href="#review/${note.clipId}">${note.sessionNumber ? `第 ${note.sessionNumber} 場測試` : '這場測試'}</a>（錄影可能已被自動清掉，回報本身不受影響）</p>` : ''}
       </div>
     </div>`;
   if (note.status === 'fixed') {
@@ -1451,7 +1843,6 @@ let draftKeys = null;
 function renderSettings() {
   const c = S.config;
   $('#sPre').value = c.preSeconds;
-  $('#sPost').value = c.postSeconds;
   $('#sOpenReview').checked = !!c.openReviewAfterMark;
   $('#sPcName').value = c.pcName || '';
   $('#mcpCmd').textContent = S.state.mcpCommand;
@@ -1509,7 +1900,6 @@ $('#btnSaveSettings').onclick = async () => {
   try {
     const r = await api('PUT', '/api/config', {
       preSeconds: Number($('#sPre').value),
-      postSeconds: Number($('#sPost').value),
       openReviewAfterMark: $('#sOpenReview').checked,
       pcName: $('#sPcName').value.trim(),
       markKeys: draftKeys.markKeys,
@@ -1537,14 +1927,8 @@ $('#btnCopyMcp').onclick = async () => {
   toast('已複製');
 };
 
-$('#ipSelect').addEventListener('change', (e) => {
-  pairIp = e.target.value;
-  localStorage.setItem('cc.pairIp', pairIp);
-  loadPair();
-});
 
-$('#btnMark').onclick = doMark;
-$('#btnRec').onclick = toggleRecord;
+
 
 // ---------------------------------------------------------------------------
 // 鍵盤
@@ -1570,11 +1954,11 @@ document.addEventListener('keydown', (e) => {
   if (S.view !== 'settings' && !e.repeat) {
     if ((S.config?.markKeys || []).includes(e.key)) {
       e.preventDefault();
-      return doMark();
+      return doMarker();
     }
     if ((S.config?.recordKeys || []).includes(e.key)) {
       e.preventDefault();
-      return toggleRecord();
+      return toggleSession();
     }
   }
   if (S.view !== 'review' || !S.review) return;
@@ -1587,10 +1971,8 @@ document.addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (k === 'ArrowLeft' || k === 'ArrowRight') {
     e.preventDefault();
-    stopPlayback();
-    R.userMoved = true;
     const step = e.shiftKey ? 10 : 1;
-    return showFrame(R.index + (k === 'ArrowLeft' ? -step : step));
+    return moveTo(R.index + (k === 'ArrowLeft' ? -step : step));
   }
   if (k === ' ') {
     e.preventDefault();
@@ -1599,26 +1981,40 @@ document.addEventListener('keydown', (e) => {
     return togglePlay();
   }
   if (k === 'Delete' || k === 'Backspace') {
-    if (R.selected >= 0) {
+    const d = draftAtIndex(R.index);
+    if (d && !d.noteId && R.selected >= 0) {
       e.preventDefault();
-      pushUndo();
-      R.annotations.splice(R.selected, 1);
+      pushUndo(d);
+      d.annotations.splice(R.selected, 1);
       R.selected = -1;
-      if (!R.annotations.length) R.anchor = null;
+      scheduleSave();
       drawReview();
     }
     return;
   }
-  const tools = { v: 'select', r: 'rect', c: 'ellipse', a: 'arrow', p: 'pen', t: 'text' };
   const lk = k.toLowerCase();
+  if (lk === 'n') return nextItem(e.shiftKey ? -1 : 1);
+  const tools = { v: 'select', r: 'rect', c: 'ellipse', a: 'arrow', p: 'pen', t: 'text' };
   if (tools[lk]) return setTool(tools[lk]);
   if (lk === 'i' || k === '[') return setRangeIn();
   if (lk === 'o' || k === ']') return setRangeOut();
+  if (k === 'Enter') {
+    e.preventDefault();
+    return $('#fDesc').focus();
+  }
 });
 
 setInterval(() => {
-  if (S.recording) updateStatusUi();
+  if (S.session) updateStatusUi();
 }, 1000);
+
+$('#btnMark').onclick = doMarker;
+$('#btnSession').onclick = toggleSession;
+$('#ipSelect').addEventListener('change', (e) => {
+  pairIp = e.target.value;
+  localStorage.setItem('cc.pairIp', pairIp);
+  loadPair();
+});
 
 // ---------------------------------------------------------------------------
 // 啟動

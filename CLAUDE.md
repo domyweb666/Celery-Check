@@ -14,6 +14,12 @@
   - `Broadcast/`：Broadcast Upload Extension，記憶體上限約 50MB，不要在這裡快取畫面
   - `Shared/`：兩個 target 都會編譯，只能用擴充允許的 API
 
+## 流程
+
+一場測試（session）＝從「開始測試」到「結束測試」的整段錄影，存在 `data/clips/<id>/`：`frames/*.jpg`、`frames.json`、`meta.json`（含 `markers` 書籤、`project`、`number`）、`drafts.json`（排查時的草稿，每筆綁一格）。F8 只插書籤不跳頁；沒在測試時按 F8 會自動開一場並補前 20 秒。「全部送出」把草稿逐筆轉成 `data/notes/<編號>/`。
+
+MCP 依 Claude Code 的資料夾（git remote 或設定裡的資料夾）判斷專案，`celery_list_notes` 預設只列那個專案。
+
 ## 手機到電腦的格式
 
 WebSocket 二進位訊息：前 8 位元組是 big-endian 毫秒時間戳，後面是 JPEG。文字訊息 `{"type":"hello","device","model"}`。改格式時兩邊要一起改。
