@@ -1,15 +1,18 @@
 @echo off
-chcp 65001 >nul
-title 芹查（關掉這個視窗就會停止）
+rem Celery-Check launcher. Keep this file ASCII-only: cmd.exe mis-reads lines that contain Chinese.
+title Celery-Check
 cd /d "%~dp0desktop"
-if not exist node_modules (
+where node >nul 2>nul
+if errorlevel 1 (
   echo.
-  echo   第一次使用，請先雙擊「安裝芹查.cmd」。
+  echo   Node.js not found. Please install the LTS version from https://nodejs.org first.
   echo.
   pause
   exit /b 1
 )
+if not exist node_modules (
+  node tools\install.js
+)
 node server\index.js --open
 echo.
-echo   芹查已停止。
 pause
