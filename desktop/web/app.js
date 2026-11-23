@@ -164,6 +164,11 @@ function onLiveMessage(msg) {
     if (S.view === 'live') renderRecentClips();
     if (S.view === 'clips') renderClips();
     if (S.view === 'review' && S.review?.clip?.id === msg.clip?.id) reloadReviewClip();
+  } else if (msg.type === 'projects') {
+    refreshState().then(() => {
+      if (S.view === 'live') $('#liveProject').innerHTML = projectOptions(S.session ? S.session.project : S.config?.lastProject || '');
+      if (S.view === 'review' && S.review) renderReviewHead();
+    });
   } else if (msg.type === 'notes-changed') {
     refreshBadge();
     if (S.view === 'notes') renderNotes();
@@ -433,7 +438,7 @@ async function renderClips() {
           <div class="s">${c.status === 'capturing' ? '<span style="color:var(--red)">● 錄影中</span>' : fmtTime(c.createdAt)}，長度 ${fmtDur(c.end - c.start)}<br>${stats.join('，')}${c.keep ? '，已保留' : ''}</div>
           <div class="clip-actions">
             <button data-open="${c.id}" class="primary">排查</button>
-            ${S.state?.ffmpeg && c.status !== 'capturing' ? `<button data-export="${c.id}">匯出 MP4</button>` : ''}
+            ${c.hasVideo ? `<a class="btn-link" href="/clips/${c.id}/session.mp4" target="_blank">看影片</a>` : c.exporting ? '<span class="muted small">轉成影片中…</span>' : S.state?.ffmpeg && c.status !== 'capturing' ? `<button data-export="${c.id}">轉成影片</button>` : ''}
             <button data-keep="${c.id}" data-v="${c.keep ? 0 : 1}">${c.keep ? '取消保留' : '保留'}</button>
             ${c.status !== 'capturing' ? `<button data-del="${c.id}" class="danger">刪除</button>` : ''}
           </div>
@@ -667,9 +672,12 @@ async function showFrame(i) {
   if (R.activeId) R.rangeTargetId = R.activeId;
   const d = draftAtIndex(i);
   R.activeId = d ? d.id : null;
+  // 停在某個書籤上，就把它當成「選中的書籤」，之後可以用 M 把它移到別格
+  const mk = markerAtIndex(i);
+  if (mk) R.selMarkerT = mk.t;
   R.selected = -1;
   updateTimeLabel();
-  if (!R.playing) {
+  if (!R.playing && !R.draggingMarker) {
     renderEditor();
     renderItems();
     setupTimeline();
@@ -715,7 +723,9 @@ function setupTimeline() {
   slider.max = Math.max(0, n - 1);
   slider.value = R.index;
   const pct = (i) => (n > 1 ? (i / (n - 1)) * 100 : 0);
-  let ticks = R.markers.map((m, k) => `<span class="tick marker" style="left:${pct(frameIndexAt(m.t))}%" title="書籤 ${k + 1}"></span>`).join('');
+  let ticks = R.markers
+    .map((m, k) => `<span class="tick marker ${m.t === R.selMarkerT ? 'sel' : ''}" data-t="${m.t}" style="left:${pct(frameIndexAt(m.t))}%" title="書籤 ${k + 1}：拖曳可以移動"></span>`)
+    .join('');
   ticks += liveDrafts()
     .filter(draftHasContent)
     .map((d) => `<span class="tick draft ${d.noteId ? 'sent' : ''}" style="left:${pct(indexOfFile(d.f))}%"></span>`)
@@ -784,7 +794,7 @@ function renderItems() {
         text = d.description.trim() ? esc(d.description.split('\n')[0]) : '已框選，還沒寫說明';
       }
       const current = it.idx === R.index || (d && d.id === R.activeId);
-      return `<li class="item ${current ? 'on' : ''}" data-idx="${it.idx}">
+      return `<li class="item ${current ? 'on' : ''}" data-idx="${it.idx}" ${it.marker ? `data-marker="${it.markerT}"` : ''}>
         <img src="/clips/${R.clip.id}/frames/${R.frames[it.idx].f}" alt="" loading="lazy">
         <div class="item-body">
           <div class="item-top"><span class="dot ${state}"></span>${fmtRel(relSec(it.idx))}${it.marker ? `<span class="item-tag">書籤 ${it.marker}</span>` : ''}</div>
@@ -818,6 +828,7 @@ $('#items').addEventListener('click', async (e) => {
   if (!li) return;
   stopPlayback();
   R.userMoved = true;
+  if (li.dataset.marker) R.selMarkerT = Number(li.dataset.marker);
   showFrame(Number(li.dataset.idx));
 });
 
@@ -847,7 +858,97 @@ function renderEditor() {
     del.hidden = true;
   }
   $('#anchorHint').hidden = true;
+  const selK = R.markers.findIndex((m) => m.t === R.selMarkerT);
+  const mm = $('#markerMove');
+  mm.hidden = selK < 0;
+  if (selK >= 0) {
+    const mi = frameIndexAt(R.markers[selK].t);
+    const here = mi === R.index;
+    $('#markerMoveText').textContent = here ? `書籤 ${selK + 1} 在這一格` : `書籤 ${selK + 1} 在 ${fmtRel(relSec(mi))}`;
+    $('#btnMoveMarker').disabled = here;
+    $('#btnMoveMarker').textContent = here ? '← → 找到正確那格再按 M' : '書籤移到這一格（M）';
+  }
 }
+
+// 把書籤移到另一格（看到問題到按下去常常慢 1、2 秒）
+async function moveMarker(oldT, newIdx) {
+  const R = S.review;
+  const k = R.markers.findIndex((m) => m.t === oldT);
+  if (k < 0) return;
+  const fr = R.frames[newIdx];
+  if (!fr || frameIndexAt(oldT) === newIdx) return;
+  const newT = fr.t;
+  if (R.markers.some((m, j) => j !== k && frameIndexAt(m.t) === newIdx)) return toast('那一格已經有別的書籤了', true);
+  // 跟著書籤走的草稿（還沒送出的）一起搬過去
+  const linked = liveDrafts().find((d) => d.markerT === oldT || (!d.markerT && d.f === R.frames[frameIndexAt(oldT)].f));
+  if (linked?.noteId) return toast(`這個書籤已經送出成回報 #${linked.number}，不能再移`, true);
+  const occupant = draftAtIndex(newIdx);
+  if (linked) {
+    if (occupant && occupant !== linked && !occupant.noteId) {
+      // 新位置已經有一筆：合併
+      occupant.description = [occupant.description, linked.description].filter(Boolean).join('\n');
+      occupant.annotations = [...occupant.annotations, ...linked.annotations];
+      occupant.markerT = newT;
+      linked.removed = true;
+    } else {
+      linked.f = fr.f;
+      linked.t = fr.t;
+      linked.markerT = newT;
+    }
+  }
+  R.markers[k] = { ...R.markers[k], t: newT };
+  R.markers.sort((a, b) => a.t - b.t);
+  R.selMarkerT = newT;
+  try {
+    await api('PATCH', `/api/clips/${R.clip.id}`, { markers: R.markers });
+  } catch (e) {
+    toast(e.message, true);
+  }
+  scheduleSave();
+  await showFrame(newIdx);
+  toast(`書籤 ${R.markers.findIndex((m) => m.t === newT) + 1} 移到 ${fmtRel(relSec(newIdx))}`, false, 1400);
+}
+
+$('#btnMoveMarker').onclick = () => {
+  const R = S.review;
+  if (R?.selMarkerT != null) moveMarker(R.selMarkerT, R.index);
+};
+
+// 直接拖時間軸上的紅色書籤
+$('#tlTicks').addEventListener('pointerdown', (e) => {
+  const tick = e.target.closest('.tick.marker');
+  const R = S.review;
+  if (!tick || !R) return;
+  e.preventDefault();
+  stopPlayback();
+  const oldT = Number(tick.dataset.t);
+  R.selMarkerT = oldT;
+  const track = $('#tlTrack').getBoundingClientRect();
+  const n = R.frames.length;
+  let idx = frameIndexAt(oldT);
+  R.draggingMarker = true; // 拖曳中不要重畫時間軸，不然手上的書籤會被換掉
+  tick.classList.add('dragging');
+  tick.setPointerCapture(e.pointerId);
+  const onMove = (ev) => {
+    const x = Math.min(1, Math.max(0, (ev.clientX - track.left) / track.width));
+    idx = Math.round(x * (n - 1));
+    tick.style.left = `${n > 1 ? (idx / (n - 1)) * 100 : 0}%`;
+    R.userMoved = true;
+    showFrame(idx);
+  };
+  const onUp = () => {
+    tick.removeEventListener('pointermove', onMove);
+    tick.removeEventListener('pointerup', onUp);
+    tick.removeEventListener('pointercancel', onUp);
+    tick.classList.remove('dragging');
+    R.draggingMarker = false;
+    if (idx !== frameIndexAt(oldT)) moveMarker(oldT, idx);
+    else showFrame(idx);
+  };
+  tick.addEventListener('pointermove', onMove);
+  tick.addEventListener('pointerup', onUp);
+  tick.addEventListener('pointercancel', onUp);
+});
 
 function nextItem(dir = 1) {
   const R = S.review;
@@ -1579,10 +1680,11 @@ async function showDone(sent) {
   $('#doneSub').textContent = `${R.clip.project || '未分類'}・#${Math.min(...nums)}${nums.length > 1 ? `–#${Math.max(...nums)}` : ''}`;
   const proj = projectByName(R.clip.project);
   $('#btnLaunch').hidden = !(proj && proj.localPath && S.state?.platform === 'win32');
+  R.sentIds = nums.join(',');
   try {
-    R.prompt = (await api('GET', `/api/notes/prompt-all?session=${encodeURIComponent(R.clip.id)}`)).prompt;
+    R.prompt = (await api('GET', `/api/notes/prompt-ids?ids=${R.sentIds}`)).prompt;
   } catch {
-    R.prompt = '請用芹查的 MCP 工具處理所有待修回報。';
+    R.prompt = `請用芹查的 MCP 工具處理回報 ${nums.map((n) => `#${n}`).join('、')}。`;
   }
 }
 
@@ -1592,7 +1694,7 @@ $('#btnCopyPrompt').onclick = async () => {
 };
 $('#btnLaunch').onclick = async () => {
   try {
-    await api('POST', '/api/notes/launch-all', { project: S.review.clip.project, session: S.review.clip.id });
+    await api('POST', '/api/notes/launch-ids', { project: S.review.clip.project, ids: S.review.sentIds });
     toast('已開啟 Claude Code 視窗');
   } catch (e) {
     toast(e.message, true);
@@ -1914,6 +2016,8 @@ let draftKeys = null;
 function renderSettings() {
   const c = S.config;
   $('#sPre').value = c.preSeconds;
+  $('#sOffset').value = c.markerOffset ?? 1;
+  $('#sScanRoots').value = (c.scanRoots || []).join('\n');
   $('#sOpenReview').checked = !!c.openReviewAfterMark;
   $('#sPcName').value = c.pcName || '';
   $('#mcpCmd').textContent = S.state.mcpCommand;
@@ -1925,8 +2029,8 @@ function renderSettings() {
 }
 
 function projRow(p) {
-  return `<tr>
-    <td><input type="text" data-k="name" value="${esc(p.name)}" placeholder="茄記"></td>
+  return `<tr data-found="${esc(p.found || '')}">
+    <td><input type="text" data-k="name" value="${esc(p.name)}" placeholder="茄記">${p.found ? `<span class="proj-kind">自動找到（${esc(p.found)}）</span>` : ''}</td>
     <td><input type="text" data-k="repo" value="${esc(p.repo)}" placeholder="domyweb666/qieji-app"></td>
     <td><input type="text" data-k="localPath" value="${esc(p.localPath)}" placeholder="C:\\Users\\你\\Projects\\qieji-app"></td>
     <td><button class="ghost" data-delrow title="刪除">✕</button></td>
@@ -1957,6 +2061,25 @@ for (const el of ['#sMarkKeys', '#sRecKeys']) {
   });
 }
 
+$('#btnScan').onclick = async () => {
+  const btn = $('#btnScan');
+  btn.disabled = true;
+  $('#scanResult').textContent = '掃描中，可能要幾十秒…';
+  try {
+    const r = await api('POST', '/api/projects/scan');
+    await refreshState();
+    renderSettings();
+    const parts = [`看過 ${r.scannedRepos} 個 git 專案`];
+    parts.push(r.added.length ? `新增 ${r.added.map((x) => x.name).join('、')}` : '沒有新的 app');
+    if (r.filled.length) parts.push(`補上資料夾：${r.filled.join('、')}`);
+    $('#scanResult').textContent = parts.join('，');
+  } catch (e) {
+    $('#scanResult').textContent = `掃描失敗：${e.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 $('#btnAddProj').onclick = () => $('#projRows').insertAdjacentHTML('beforeend', projRow({ name: '', repo: '', localPath: '' }));
 $('#projRows').addEventListener('click', (e) => {
   if (e.target.closest('[data-delrow]')) e.target.closest('tr').remove();
@@ -1966,11 +2089,14 @@ $('#btnSaveSettings').onclick = async () => {
   const projects = $$('#projRows tr').map((tr) => {
     const o = {};
     for (const inp of $$('input', tr)) o[inp.dataset.k] = inp.value.trim();
+    if (tr.dataset.found) o.found = tr.dataset.found;
     return o;
   });
   try {
     const r = await api('PUT', '/api/config', {
       preSeconds: Number($('#sPre').value),
+      markerOffset: Number($('#sOffset').value),
+      scanRoots: $('#sScanRoots').value.split(/\r?\n/),
       openReviewAfterMark: $('#sOpenReview').checked,
       pcName: $('#sPcName').value.trim(),
       markKeys: draftKeys.markKeys,
@@ -2065,6 +2191,7 @@ document.addEventListener('keydown', (e) => {
   }
   const lk = k.toLowerCase();
   if (lk === 'n') return nextItem(e.shiftKey ? -1 : 1);
+  if (lk === 'm' && R.selMarkerT != null) return moveMarker(R.selMarkerT, R.index);
   const tools = { v: 'select', r: 'rect', c: 'ellipse', a: 'arrow', p: 'pen', t: 'text' };
   if (tools[lk]) return setTool(tools[lk]);
   if (lk === 'i' || k === '[') return setRangeIn();

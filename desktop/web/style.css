@@ -393,6 +393,7 @@ main { flex: 1; min-height: 0; overflow: auto; }
   max-width: 80vw;
 }
 .toast.err { background: var(--red); }
+.toast { pointer-events: none; } /* 不要擋住下面的時間軸 */
 .lightbox { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.85); display: flex; align-items: center; justify-content: center; z-index: 40; cursor: zoom-out; padding: 30px; }
 .lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; }
 
@@ -464,3 +465,15 @@ a.rec-pill { text-decoration: none; cursor: pointer; }
 .qn-hint { font-size: 12px; color: #a9ada4; }
 .quicknote input { background: #2b2e29; border-color: #3d413a; color: #fff; font-size: 16px; padding: 10px 12px; }
 .quicknote input:focus { outline: 2px solid #ff8a8d; border-color: #ff8a8d; }
+
+.scan-row { display: flex; gap: 12px; align-items: center; margin: 4px 0 12px; flex-wrap: wrap; }
+.proj-kind { font-size: 11px; color: var(--muted); display: block; margin-top: 2px; }
+.tick.marker { pointer-events: auto; cursor: ew-resize; width: 7px; margin-left: -3px; background: transparent; }
+.tick.marker::after { content: ''; position: absolute; left: 2px; top: 0; width: 3px; height: 26px; background: var(--red); border-radius: 2px; }
+.tick.marker.sel::after { width: 5px; left: 1px; box-shadow: 0 0 0 2px #fff, 0 0 0 3px var(--red); }
+.tick.marker.dragging::after { background: #ff8a8d; }
+.tl-ticks { z-index: 3; }
+.marker-move { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 13px; color: var(--muted); }
+.marker-move button { padding: 4px 10px; font-size: 13px; }
+a.btn-link { display: inline-block; border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; font-size: 13px; color: var(--text); text-decoration: none; background: var(--panel); }
+a.btn-link:hover { background: #f7f8f4; }

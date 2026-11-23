@@ -10,6 +10,8 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { WebSocketServer } from 'ws';
 import QRCode from 'qrcode';
+import { createRequire } from 'node:module';
+import { scanProjects } from './projects.js';
 import {
   ROOT,
   DATA_DIR,
@@ -188,7 +190,10 @@ function startSession({ preMs, project = '' }) {
 }
 
 function addMarker(cap) {
-  const t = latest ? latest.t : Date.now();
+  // 看到問題到按下去通常慢 1 到 2 秒：書籤自動往前推一點（設定頁可改）
+  const offset = Math.max(0, Number(config.markerOffset) || 0) * 1000;
+  const first = cap.frames[0]?.t ?? 0;
+  const t = Math.max(first, (latest ? latest.t : Date.now()) - offset);
   // 一秒內連按兩次（例如踏板彈跳）只算一次
   const last = cap.markers[cap.markers.length - 1];
   if (last && Math.abs(last.t - t) < 800) return cap.markers.length - 1;
@@ -241,6 +246,8 @@ function finishCapture(id) {
   const meta = writeClipMeta(cap, 'ready');
   broadcast({ type: 'clip', clip: meta });
   pruneClips();
+  // 背景把整場轉成一支 mp4，給 Claude 和你自己看
+  if (hasFfmpeg()) setTimeout(() => exportClipMp4(id).catch((e) => console.error('[轉影片]', e.message)), 500);
   return meta;
 }
 
@@ -268,24 +275,34 @@ function pruneClips() {
   }
 }
 
-// 用 ffmpeg 把片段轉成 mp4（有裝 ffmpeg 才能用）
-let ffmpegOk = null;
-function hasFfmpeg() {
-  if (ffmpegOk === null) {
+// 用 ffmpeg 把整場測試轉成一支 mp4。先找電腦上的 ffmpeg，沒有就用安裝時一起下載的 ffmpeg-static。
+let ffmpegBin = undefined;
+function findFfmpeg() {
+  if (ffmpegBin !== undefined) return ffmpegBin;
+  ffmpegBin = null;
+  try {
+    if (spawnSync('ffmpeg', ['-version'], { stdio: 'ignore', windowsHide: true }).status === 0) ffmpegBin = 'ffmpeg';
+  } catch {}
+  if (!ffmpegBin) {
     try {
-      ffmpegOk = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore', windowsHide: true }).status === 0;
-    } catch {
-      ffmpegOk = false;
-    }
+      const p = createRequire(import.meta.url)('ffmpeg-static');
+      if (p && fs.existsSync(p)) ffmpegBin = p;
+    } catch {}
   }
-  return ffmpegOk;
+  return ffmpegBin;
+}
+function hasFfmpeg() {
+  return !!findFfmpeg();
 }
 
+const exporting = new Map(); // id -> Promise
+
 function exportClipMp4(id) {
-  return new Promise((resolve, reject) => {
+  if (exporting.has(id)) return exporting.get(id);
+  const job = new Promise((resolve, reject) => {
     const clip = getClip(id);
     if (!clip || !clip.frames.length) return reject(new Error('片段是空的'));
-    if (!hasFfmpeg()) return reject(new Error('這台電腦沒有 ffmpeg，裝好後重開芹查就能匯出影片'));
+    if (!hasFfmpeg()) return reject(new Error('找不到 ffmpeg，沒辦法轉成影片。重新執行一次「安裝芹查.cmd」會自動下載'));
     const dir = clipDir(id);
     const list = [];
     clip.frames.forEach((fr, i) => {
@@ -295,17 +312,27 @@ function exportClipMp4(id) {
     });
     list.push(`file 'frames/${clip.frames[clip.frames.length - 1].f}'`);
     fs.writeFileSync(path.join(dir, 'ffconcat.txt'), list.join('\n'));
-    const out = path.join(dir, 'clip.mp4');
+    const out = path.join(dir, 'session.mp4');
     const p = spawn(
-      'ffmpeg',
-      ['-y', '-f', 'concat', '-safe', '0', '-i', 'ffconcat.txt', '-fps_mode', 'vfr', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-preset', 'veryfast', 'clip.mp4'],
+      findFfmpeg(),
+      ['-y', '-f', 'concat', '-safe', '0', '-i', 'ffconcat.txt', '-fps_mode', 'vfr', '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', 'session.tmp.mp4'],
       { cwd: dir, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] },
     );
     let err = '';
     p.stderr.on('data', (d) => (err = (err + d).slice(-2000)));
     p.on('error', reject);
-    p.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`ffmpeg 失敗：${err.split('\n').slice(-3).join(' ')}`))));
-  });
+    p.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`ffmpeg 失敗：${err.split('\n').slice(-3).join(' ')}`));
+      try {
+        fs.renameSync(path.join(dir, 'session.tmp.mp4'), out);
+        fs.rmSync(path.join(dir, 'ffconcat.txt'), { force: true });
+      } catch {}
+      broadcast({ type: 'clip', clip: readJSON(path.join(dir, 'meta.json'), null) });
+      resolve(out);
+    });
+  }).finally(() => exporting.delete(id));
+  exporting.set(id, job);
+  return job;
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +467,18 @@ function claudePrompt(note) {
   };
 }
 
+function idsPrompt(ids) {
+  const list = String(ids || '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter((x) => /^\d+$/.test(x));
+  const tags = list.map((x) => `#${x}`).join('、');
+  return {
+    zh: `請用芹查的 MCP 工具處理這次送出的 ${list.length} 筆回報：${tags}。先用 celery_get_session 看這場測試的整體流程，再用 celery_get_note 逐筆讀取、修正，看不懂的地方用 celery_get_frames 翻錄影；每修好一筆就用 celery_mark_fixed 寫下改了什麼。全部改完再一起 commit。`,
+    ascii: `Use the celery-check MCP tools to handle these ${list.length} reports: ${list.map((x) => `#${x}`).join(', ')}. First call celery_get_session (id ${list[0] || ''}) for the overall flow, then read each with celery_get_note, use celery_get_frames when you need more context, fix the code, and call celery_mark_fixed with a summary in Traditional Chinese. Commit once after all fixes. Reply to me in Traditional Chinese.`,
+  };
+}
+
 function allOpenPrompt(project, session) {
   const meta = session ? readJSON(path.join(clipDir(safeId(session)), 'meta.json'), null) : null;
   const scope = meta ? `第 ${meta.number} 場測試的` : project ? `「${project}」的` : '';
@@ -499,18 +538,27 @@ async function handleApi(req, res, url) {
 
   if (p === '/api/config' && m === 'PUT') {
     const body = await readBody(req);
-    const allowed = ['pcName', 'preSeconds', 'bufferSeconds', 'markKeys', 'recordKeys', 'openReviewAfterMark', 'projects', 'lastProject'];
+    const allowed = ['pcName', 'preSeconds', 'bufferSeconds', 'markKeys', 'recordKeys', 'openReviewAfterMark', 'projects', 'lastProject', 'scanRoots', 'markerOffset'];
     const patch = {};
     for (const k of allowed) if (k in body) patch[k] = body[k];
     if ('preSeconds' in patch) patch.preSeconds = Math.min(60, Math.max(1, Number(patch.preSeconds) || 20));
     patch.bufferSeconds = Math.max(Number(patch.preSeconds ?? config.preSeconds) + 10, Number(patch.bufferSeconds ?? config.bufferSeconds) || 40);
+    if ('markerOffset' in patch) patch.markerOffset = Math.min(5, Math.max(0, Number(patch.markerOffset) || 0));
+    if (Array.isArray(patch.scanRoots)) patch.scanRoots = patch.scanRoots.map((x) => String(x).trim()).filter(Boolean);
     if (Array.isArray(patch.projects)) {
       patch.projects = patch.projects
-        .map((x) => ({ name: String(x.name || '').trim(), repo: String(x.repo || '').trim(), localPath: String(x.localPath || '').trim() }))
+        .map((x) => ({ name: String(x.name || '').trim(), repo: String(x.repo || '').trim(), localPath: String(x.localPath || '').trim(), ...(x.found ? { found: String(x.found) } : {}) }))
         .filter((x) => x.name);
     }
     config = saveConfig(patch);
     return send(res, 200, { ok: true, config });
+  }
+
+  if (p === '/api/projects/scan' && m === 'POST') {
+    const r = await scanProjects();
+    config = loadConfig();
+    if (r.added.length) broadcast({ type: 'projects' });
+    return send(res, 200, { ok: true, ...r, projects: config.projects });
   }
 
   if (p === '/api/config/new-token' && m === 'POST') {
@@ -572,6 +620,8 @@ async function handleApi(req, res, url) {
         ...(live ? { frameCount: live.frames.length, end: live.frames[live.frames.length - 1]?.t ?? c.end, markers: live.markers } : {}),
         draftCount: drafts.filter((d) => !d.noteId).length,
         sentCount: drafts.filter((d) => d.noteId).length,
+        hasVideo: fs.existsSync(path.join(clipDir(c.id), 'session.mp4')),
+        exporting: exporting.has(c.id),
       };
     });
     return send(res, 200, clips);
@@ -663,7 +713,7 @@ async function handleApi(req, res, url) {
 
   if ((mm = /^\/api\/clips\/([^/]+)\/export$/.exec(p)) && m === 'POST') {
     const out = await exportClipMp4(safeId(mm[1]));
-    return send(res, 200, { ok: true, url: `/clips/${mm[1]}/clip.mp4`, path: out });
+    return send(res, 200, { ok: true, url: `/clips/${mm[1]}/session.mp4`, path: out });
   }
 
   // ---- 回報 ----
@@ -696,6 +746,18 @@ async function handleApi(req, res, url) {
     const project = url.searchParams.get('project') || '';
     const session = url.searchParams.get('session') || '';
     return send(res, 200, { prompt: allOpenPrompt(project, session).zh });
+  }
+
+  // 這次送出的那幾筆：只叫 Claude 處理這幾筆，不會把之前送過的重做
+  if (p === '/api/notes/prompt-ids' && m === 'GET') {
+    return send(res, 200, { prompt: idsPrompt(url.searchParams.get('ids')).zh });
+  }
+
+  if (p === '/api/notes/launch-ids' && m === 'POST') {
+    const body = await readBody(req);
+    const proj = projectByName(body.project);
+    launchClaude(proj?.localPath, idsPrompt(body.ids).ascii, `Celery-Check ${body.project || ''}`);
+    return send(res, 200, { ok: true });
   }
 
   if (p === '/api/notes/launch-all' && m === 'POST') {
@@ -883,6 +945,16 @@ server.listen(config.port, '0.0.0.0', () => {
   console.log(`  資料存在：${DATA_DIR}`);
   console.log('  關閉這個視窗就會停止芹查。');
   console.log('');
+  // 背景掃描電腦上的 iOS app，新的加進專案清單
+  scanProjects()
+    .then((r) => {
+      config = loadConfig();
+      if (r.added.length) {
+        console.log(`  找到新的 app 專案：${r.added.map((x) => x.name).join('、')}`);
+        broadcast({ type: 'projects' });
+      }
+    })
+    .catch((e) => console.error('[掃描專案]', e.message));
   if (process.argv.includes('--open') && process.platform === 'win32') {
     spawn('cmd.exe', ['/c', 'start', '', `http://localhost:${config.port}`], { detached: true, stdio: 'ignore' }).unref();
   }

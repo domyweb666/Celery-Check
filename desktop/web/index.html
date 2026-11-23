@@ -181,6 +181,10 @@
 
             <div class="editor" id="editor">
               <div class="editor-title" id="editorTitle"></div>
+              <div class="marker-move" id="markerMove" hidden>
+                <span id="markerMoveText"></span>
+                <button id="btnMoveMarker" title="按鍵 M">書籤移到這一格（M）</button>
+              </div>
               <textarea id="fDesc" rows="5" placeholder="哪裡不對？你希望變成怎樣？&#10;例：這個按鈕太小，單手按不到，放大一點、往上移"></textarea>
               <div class="range-info" id="rangeInfo"></div>
               <div class="editor-actions">
@@ -240,7 +244,11 @@
 
           <div class="card">
             <h2>專案</h2>
-            <p class="muted">回報要指定是哪個 app 的。填「電腦上的資料夾」後，就能一鍵在那個資料夾開 Claude Code 處理。</p>
+            <p class="muted">芹查每次啟動會掃描電腦，把 iOS app 專案（有 Xcode 專案、XcodeGen 的 project.yml、Expo 或 Flutter 的 iOS 設定）自動加進來，網站、腳本之類的不會。認專案靠的是資料夾裡 git 設定的 GitHub repo 名稱。名稱可以改成你習慣的叫法。</p>
+            <div class="scan-row">
+              <button id="btnScan">重新掃描電腦上的 app</button>
+              <span class="muted small" id="scanResult"></span>
+            </div>
             <table class="proj-table">
               <thead><tr><th>名稱</th><th>GitHub repo</th><th>電腦上的資料夾</th><th></th></tr></thead>
               <tbody id="projRows"></tbody>
@@ -261,6 +269,9 @@
               </div>
               <label>沒開始測試就插書籤時，往回補幾秒
                 <input type="number" id="sPre" min="1" max="60" />
+              </label>
+              <label>插書籤時自動往前推幾秒（抵掉看到問題到按下去的延遲）
+                <input type="number" id="sOffset" min="0" max="5" step="0.5" />
               </label>
             </div>
             <label class="check"><input type="checkbox" id="sOpenReview" /> 插書籤後直接打開排查畫面（邊錄邊框選）</label>
@@ -284,7 +295,10 @@
 
           <div class="card">
             <h2>資料</h2>
-            <p class="muted">片段和回報都存在：<code id="dataDir"></code></p>
+            <p class="muted">測試錄影和回報都存在：<code id="dataDir"></code></p>
+            <label>另外要掃描的資料夾（一行一個；預設已掃描使用者資料夾和 D: 之後的磁碟）
+              <textarea id="sScanRoots" rows="2" placeholder="例如 E:\work"></textarea>
+            </label>
           </div>
 
           <div class="settings-actions">

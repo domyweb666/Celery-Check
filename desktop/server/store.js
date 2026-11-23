@@ -47,6 +47,8 @@ const DEFAULT_CONFIG = {
   nextNoteNumber: 1,
   nextSessionNumber: 1,
   lastProject: '',
+  markerOffset: 1,
+  scanRoots: [],
 };
 
 // ---------- 小工具 ----------
@@ -328,6 +330,8 @@ export function noteToText(note) {
     if (note.range) t += `；多米特別選的區間是 ${fmtClock(note.range.start)} 到 ${fmtClock(note.range.end)}`;
     lines.push(t);
     if (note.clipId) {
+      const video = path.join(CLIPS_DIR, note.clipId, 'session.mp4');
+      if (fs.existsSync(video)) lines.push(`整場錄影檔：${video}（問題在 ${fmtClock(note.frameTime)}）`);
       lines.push(
         `想看更多前後畫面（例如多米是怎麼操作到這一步的），用 celery_get_frames 指定時間範圍自己翻錄影；想看整場測試的流程，用 celery_get_session。`,
       );

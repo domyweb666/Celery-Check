@@ -7,76 +7,13 @@ import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { detectProject } from './projects.js';
 import { loadConfig, saveConfig, listNotes, listClips, getClip, clipDir, readJSON, getNote, noteDir, noteToText, updateNoteStatus, STATUS_LABEL, localTime, fmtClock } from './store.js';
 
-// ---------------------------------------------------------------------------
-// Claude Code 是在哪個專案資料夾打開的？
-// 找資料夾裡的 .git，讀 GitHub repo 名稱，對到芹查設定裡的專案。
-// 對到了而芹查還不知道這個專案在電腦上的哪裡，就順便記下來（「用 Claude Code 開啟」會用到）。
-// ---------------------------------------------------------------------------
-
-function findGitRoot(start) {
-  let dir = path.resolve(start);
-  for (let i = 0; i < 30; i++) {
-    if (fs.existsSync(path.join(dir, '.git'))) return dir;
-    const up = path.dirname(dir);
-    if (up === dir) return null;
-    dir = up;
-  }
-  return null;
-}
-
-function readGitRepo(root) {
-  try {
-    let gitDir = path.join(root, '.git');
-    if (fs.statSync(gitDir).isFile()) {
-      const m = /gitdir:\s*(.+)/.exec(fs.readFileSync(gitDir, 'utf8'));
-      if (m) gitDir = path.resolve(root, m[1].trim());
-    }
-    const cfg = fs.readFileSync(path.join(gitDir, 'config'), 'utf8');
-    const urls = [...cfg.matchAll(/url\s*=\s*(.+)/g)].map((x) => x[1].trim());
-    for (const u of urls) {
-      const m = /github\.com[:/]([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i.exec(u);
-      if (m) return `${m[1]}/${m[2]}`;
-    }
-  } catch {}
-  return null;
-}
-
-function samePath(a, b) {
-  if (!a || !b) return false;
-  const norm = (x) => path.resolve(x).replace(/[\\/]+$/, '').toLowerCase();
-  return norm(a) === norm(b);
-}
-
-function detectProject() {
-  const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const root = findGitRoot(cwd) || cwd;
-  const repo = readGitRepo(root);
-  const cfg = loadConfig();
-  const projects = [...(cfg.projects || [])];
-  let p = projects.find((x) => samePath(x.localPath, root));
-  if (!p && repo) p = projects.find((x) => x.repo && x.repo.toLowerCase() === repo.toLowerCase());
-  if (p) {
-    if (!p.localPath) {
-      p.localPath = root;
-      saveConfig({ projects });
-    }
-    return { name: p.name, root, repo, learned: false };
-  }
-  if (repo) {
-    // 芹查還不認識這個 repo：用 repo 名稱新增一個專案
-    const name = repo.split('/')[1];
-    projects.push({ name, repo, localPath: root });
-    saveConfig({ projects });
-    return { name, root, repo, learned: true };
-  }
-  return { name: null, root, repo: null, learned: false };
-}
-
+// Claude Code 是在哪個專案資料夾打開的？判斷方式見 projects.js
 let here = null;
 function currentProject() {
-  if (!here) here = detectProject();
+  if (!here) here = detectProject(process.env.CLAUDE_PROJECT_DIR || process.cwd());
   return here;
 }
 
