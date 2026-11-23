@@ -39,11 +39,31 @@ import {
 const WEB_DIR = path.join(ROOT, 'web');
 const ERROR_LOG = path.join(DATA_DIR, 'error.log');
 
+// 啟動後就不再寫到黑色視窗：Windows 上點到那個視窗（選取文字）會讓寫入卡住，整個芹查跟著停住。
+// 之後的紀錄都寫進 data/server.log 和 data/error.log。
+const SERVER_LOG = path.join(DATA_DIR, 'server.log');
+function stamp2() {
+  return new Date().toLocaleString('zh-TW', { hour12: false });
+}
+function logEvent(text) {
+  try {
+    fs.appendFileSync(SERVER_LOG, `[${stamp2()}] ${text}\n`);
+  } catch {}
+}
 function logError(where, e) {
-  const line = `[${new Date().toLocaleString('zh-TW', { hour12: false })}] ${where}：${e?.stack || e}`;
-  console.error(line);
+  const line = `[${stamp2()}] ${where}：${e?.stack || e}`;
   try {
     fs.appendFileSync(ERROR_LOG, `${line}\n`);
+    fs.appendFileSync(SERVER_LOG, `${line}\n`);
+  } catch {}
+}
+process.on('exit', (code) => logEvent(`芹查結束（代碼 ${code}）`));
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) {
+  try {
+    process.on(sig, () => {
+      logEvent(`收到 ${sig}，芹查結束`);
+      process.exit(0);
+    });
   } catch {}
 }
 
@@ -268,7 +288,7 @@ function finishCapture(id) {
   broadcast({ type: 'clip', clip: meta });
   pruneClips();
   // 背景把整場轉成一支 mp4，給 Claude 和你自己看
-  if (hasFfmpeg()) setTimeout(() => exportClipMp4(id).catch((e) => console.error('[轉影片]', e.message)), 500);
+  if (hasFfmpeg()) setTimeout(() => exportClipMp4(id).catch((e) => logError('轉影片', e)), 500);
   return meta;
 }
 
@@ -955,7 +975,7 @@ ingestWss.on('connection', (ws, req, url) => {
   phone.connectedAt = Date.now();
   phone.device = url.searchParams.get('d') || 'iPhone';
   phone.model = url.searchParams.get('m') || '';
-  console.log(`[手機] 已連上：${phone.device} ${phone.model}（${req.socket.remoteAddress}）`);
+  logEvent(`手機已連上：${phone.device} ${phone.model}（${req.socket.remoteAddress}）`);
   broadcast({ type: 'phone', event: 'connected', phone: phoneStatus() });
 
   ws.on('message', (data, isBinary) => {
@@ -985,7 +1005,7 @@ ingestWss.on('connection', (ws, req, url) => {
     if (phone.socket === ws) {
       phone.socket = null;
       phone.connected = false;
-      console.log('[手機] 已中斷');
+      logEvent('手機已中斷');
       broadcast({ type: 'phone', event: 'disconnected', phone: phoneStatus() });
       const cap = activeSession();
       if (cap) finishCapture(cap.id);
@@ -1015,7 +1035,9 @@ for (const c of listClips()) {
 server.on('error', (e) => {
   if (e.code === 'EADDRINUSE') {
     console.error(`\n埠號 ${config.port} 已經被占用。芹查可能已經在執行了，直接打開 http://localhost:${config.port} 就好。\n`);
-  } else console.error(e);
+    process.exit(3); // 3：已經在執行，啟動程式不要自動重開
+  }
+  logError('伺服器', e);
   process.exit(1);
 });
 
@@ -1026,18 +1048,20 @@ server.listen(config.port, '0.0.0.0', () => {
   console.log(`  電腦上打開：http://localhost:${config.port}`);
   if (addrs.length) console.log(`  手機連線位址：${addrs.map((a) => a.address).join('、')}`);
   console.log(`  資料存在：${DATA_DIR}`);
-  console.log('  關閉這個視窗就會停止芹查。');
+  console.log('  關閉這個視窗就會停止芹查。請不要點這個視窗裡面（Windows 會讓它暫停）。');
+  console.log(`  紀錄檔：${SERVER_LOG}`);
   console.log('');
   // 背景掃描電腦上的 iOS app，新的加進專案清單
   scanProjects()
     .then((r) => {
       config = loadConfig();
       if (r.added.length) {
-        console.log(`  找到新的 app 專案：${r.added.map((x) => x.name).join('、')}`);
+        logEvent(`找到新的 app 專案：${r.added.map((x) => x.name).join('、')}`);
         broadcast({ type: 'projects' });
       }
     })
-    .catch((e) => console.error('[掃描專案]', e.message));
+    .catch((e) => logError('掃描專案', e));
+  logEvent(`芹查已啟動（port ${config.port}）`);
   if (process.argv.includes('--open') && process.platform === 'win32') {
     spawn('cmd.exe', ['/c', 'start', '', `http://localhost:${config.port}`], { detached: true, stdio: 'ignore' }).unref();
   }
