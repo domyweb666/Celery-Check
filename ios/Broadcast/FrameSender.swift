@@ -1,4 +1,5 @@
 import Foundation
+import QuartzCore
 
 /// 用 WebSocket 把畫面推給電腦上的芹查。
 /// 每一則訊息：前 8 個位元組是毫秒時間戳（big-endian），後面接 JPEG。
@@ -20,13 +21,16 @@ final class FrameSender: NSObject, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     private var connected = false
     private var stopped = false
-    private var inFlight = 0
+    /// 已送出、還沒收到電腦回「收到」的格（記送出時間）
+    private var inFlight: [Double] = []
     private var retryCount = 0
     private var pingTimer: DispatchSourceTimer?
     private(set) var framesSent = 0
 
-    /// 同時最多幾格還在傳；網路慢時直接跳格，不讓記憶體越積越多（擴充只有約 50MB 可用）
+    /// 同時最多幾格還沒被電腦收到。網路慢時直接跳格，只送最新的畫面，延遲才不會越積越大
     private let maxInFlight = 2
+    /// 等太久沒回應就當作掉了（舊版電腦端不會回「收到」，也靠這個繼續送）
+    private let ackTimeout: Double = 1.0
 
     init(pair: PairInfo) {
         self.pair = pair
@@ -63,7 +67,14 @@ final class FrameSender: NSObject, URLSessionWebSocketDelegate {
     var canSend: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return connected && !stopped && inFlight < maxInFlight
+        pruneInFlight()
+        return connected && !stopped && inFlight.count < maxInFlight
+    }
+
+    /// 呼叫前要先拿 lock
+    private func pruneInFlight() {
+        let now = CACurrentMediaTime()
+        inFlight.removeAll { now - $0 > ackTimeout }
     }
 
     var sentCount: Int {
@@ -74,11 +85,12 @@ final class FrameSender: NSObject, URLSessionWebSocketDelegate {
 
     func send(jpeg: Data, at date: Date) {
         lock.lock()
-        guard connected, !stopped, let t = task, inFlight < maxInFlight else {
+        pruneInFlight()
+        guard connected, !stopped, let t = task, inFlight.count < maxInFlight else {
             lock.unlock()
             return
         }
-        inFlight += 1
+        inFlight.append(CACurrentMediaTime())
         lock.unlock()
 
         var ms = UInt64(max(0, date.timeIntervalSince1970 * 1000)).bigEndian
@@ -88,7 +100,6 @@ final class FrameSender: NSObject, URLSessionWebSocketDelegate {
         t.send(.data(payload)) { [weak self] error in
             guard let self else { return }
             self.lock.lock()
-            self.inFlight = max(0, self.inFlight - 1)
             if error == nil { self.framesSent += 1 }
             self.lock.unlock()
             if error != nil { self.handleDrop(of: t, reason: "傳送中斷") }
@@ -113,7 +124,7 @@ final class FrameSender: NSObject, URLSessionWebSocketDelegate {
         lock.lock()
         task = t
         connected = false
-        inFlight = 0
+        inFlight.removeAll()
         lock.unlock()
         t.resume()
         receive(on: t)
@@ -124,7 +135,13 @@ final class FrameSender: NSObject, URLSessionWebSocketDelegate {
         t.receive { [weak self] result in
             guard let self else { return }
             switch result {
-            case .success:
+            case .success(let message):
+                // 電腦每收到一格會回一個 "a"
+                if case .string(let text) = message, text == "a" {
+                    self.lock.lock()
+                    if !self.inFlight.isEmpty { self.inFlight.removeFirst() }
+                    self.lock.unlock()
+                }
                 self.receive(on: t)
             case .failure:
                 self.handleDrop(of: t, reason: "連線中斷")
@@ -144,7 +161,7 @@ final class FrameSender: NSObject, URLSessionWebSocketDelegate {
             self.lock.lock()
             self.task = nil
             self.connected = false
-            self.inFlight = 0
+            self.inFlight.removeAll()
             self.retryCount += 1
             let delay = min(5.0, 1.0 + Double(self.retryCount))
             self.lock.unlock()

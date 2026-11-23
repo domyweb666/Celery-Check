@@ -186,6 +186,11 @@
                 <button id="btnMoveMarker" title="按鍵 M">書籤移到這一格（M）</button>
               </div>
               <textarea id="fDesc" rows="5" placeholder="哪裡不對？你希望變成怎樣？&#10;例：這個按鈕太小，單手按不到，放大一點、往上移"></textarea>
+              <div class="attach" id="attachBox">
+                <div class="attach-list" id="attachList"></div>
+                <button class="attach-add" id="btnAttach" title="也可以把檔案拖進來，或在說明欄按 Ctrl+V 貼上截圖">＋ 附加圖片或檔案</button>
+                <input type="file" id="attachInput" multiple hidden />
+              </div>
               <div class="range-info" id="rangeInfo"></div>
               <div class="editor-actions">
                 <button class="ghost danger" id="btnDelDraft">刪掉這筆</button>
@@ -203,7 +208,9 @@
               <h2 id="doneTitle">已送出</h2>
               <p class="muted" id="doneSub"></p>
               <button class="primary wide" id="btnCopyPrompt">複製給 Claude</button>
-              <button class="wide" id="btnLaunch">用 Claude Code 開啟</button>
+              <button class="wide" id="btnLaunch">開新的 Claude Code 視窗處理</button>
+              <button class="wide" id="btnLaunchResume">接著上次的 Claude Code 對話處理</button>
+              <p class="muted small" id="launchHint">「複製給 Claude」貼到哪個視窗都行，只要那個視窗是在這個 app 的資料夾開的。</p>
               <button class="wide ghost" id="btnKeepEditing">回到這場測試</button>
               <button class="wide ghost" id="btnBackLive">回到即時畫面</button>
             </div>

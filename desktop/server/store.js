@@ -62,10 +62,36 @@ export function readJSON(file, fallback) {
 }
 
 // 先寫暫存檔再改名，避免伺服器和 MCP 同時寫時讀到半個檔案
-export function writeJSON(file, data) {
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Windows 上防毒軟體掃描剛寫好的檔案時會短暫鎖住它，改名會失敗：重試幾次，真的不行就直接覆寫
+export function writeJSON(file, data, { compact = false } = {}) {
+  const text = compact ? JSON.stringify(data) : JSON.stringify(data, null, 2);
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmp, file);
+  fs.writeFileSync(tmp, text, 'utf8');
+  for (let i = 0; i < 6; i++) {
+    try {
+      fs.renameSync(tmp, file);
+      return;
+    } catch (e) {
+      if (!['EPERM', 'EBUSY', 'EACCES'].includes(e.code)) {
+        try {
+          fs.rmSync(tmp, { force: true });
+        } catch {}
+        throw e;
+      }
+      sleepSync(15 * (i + 1));
+    }
+  }
+  try {
+    fs.writeFileSync(file, text, 'utf8');
+  } finally {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {}
+  }
 }
 
 function pad(n, w = 2) {
@@ -215,6 +241,30 @@ export function createNote(input) {
   if (writeDataUrl(path.join(dir, 'crop.png'), input.images?.crop)) files.crop = 'crop.png';
   if (writeDataUrl(path.join(dir, 'sequence.jpg'), input.images?.sequence)) files.sequence = 'sequence.jpg';
 
+  // 附檔：從測試場次的資料夾複製到回報資料夾
+  const attachments = [];
+  if (input.clipId && Array.isArray(input.attachments)) {
+    for (const a of input.attachments) {
+      try {
+        const rel = String(a.file || '');
+        if (!/^attachments\/[A-Za-z0-9_-]+\/[^/\\]+$/.test(rel)) continue;
+        const src = path.join(clipDir(input.clipId), ...rel.split('/'));
+        const name = path.basename(rel);
+        fs.mkdirSync(path.join(dir, 'attachments'), { recursive: true });
+        let target = name;
+        for (let n = 2; fs.existsSync(path.join(dir, 'attachments', target)); n++) {
+          const ext = path.extname(name);
+          target = `${path.basename(name, ext)}-${n}${ext}`;
+        }
+        fs.copyFileSync(src, path.join(dir, 'attachments', target));
+        attachments.push({ name: target, file: `attachments/${target}`, size: a.size || 0, type: a.type || '' });
+      } catch {
+        /* 附檔不見了就略過 */
+      }
+    }
+  }
+  if (attachments.length) files.attachments = attachments;
+
   // 原始畫面直接從片段複製，不經過瀏覽器重新壓縮
   if (input.clipId && input.frameFile) {
     try {
@@ -340,6 +390,14 @@ export function noteToText(note) {
   lines.push('');
   lines.push('## 多米的說明');
   lines.push(note.description || '（沒有寫說明，請看圖上的標註）');
+  if (note.files?.attachments?.length) {
+    lines.push('');
+    lines.push('## 多米另外附的檔案');
+    for (const a of note.files.attachments) {
+      const kb = a.size ? `，${Math.max(1, Math.round(a.size / 1024))} KB` : '';
+      lines.push(`- ${a.name}（${a.type || '檔案'}${kb}）：${path.join(NOTES_DIR, note.id, ...a.file.split('/'))}`);
+    }
+  }
   if (note.annotations?.length) {
     lines.push('');
     lines.push('## 圖上的標註');

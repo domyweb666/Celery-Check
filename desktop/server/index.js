@@ -37,6 +37,19 @@ import {
 } from './store.js';
 
 const WEB_DIR = path.join(ROOT, 'web');
+const ERROR_LOG = path.join(DATA_DIR, 'error.log');
+
+function logError(where, e) {
+  const line = `[${new Date().toLocaleString('zh-TW', { hour12: false })}] ${where}：${e?.stack || e}`;
+  console.error(line);
+  try {
+    fs.appendFileSync(ERROR_LOG, `${line}\n`);
+  } catch {}
+}
+
+// 任何沒接到的錯誤都只記下來，不讓芹查整個停掉
+process.on('uncaughtException', (e) => logError('未處理的錯誤', e));
+process.on('unhandledRejection', (e) => logError('未處理的錯誤', e));
 const MAX_CLIPS = 20; // 最多留幾場測試
 let config = loadConfig();
 
@@ -57,6 +70,7 @@ const phone = {
   width: 0,
   height: 0,
   frameTimes: [], // 算每秒幾格
+  lags: [],
   received: 0,
 };
 
@@ -92,6 +106,12 @@ function onPhoneFrame(data) {
   let t = Number(data.readBigUInt64BE(0));
   const buf = data.subarray(8);
   const now = Date.now();
+  // 延遲：手機拍下這格到電腦收到（兩邊時鐘都有網路校時，誤差通常很小）
+  const lag = now - t;
+  if (Number.isFinite(lag) && lag > -2000 && lag < 30000) {
+    phone.lags.push(lag);
+    if (phone.lags.length > 30) phone.lags.shift();
+  }
   // 手機和電腦時鐘可能差一點；差太多就用電腦時間
   if (!Number.isFinite(t) || Math.abs(t - now) > 5000) t = now;
   if (latest && t <= latest.t) t = latest.t + 1;
@@ -131,6 +151,7 @@ function phoneStatus() {
     height: phone.height,
     lastFrameAt: phone.lastFrameAt,
     lastFrameAge: phone.lastFrameAt ? now - phone.lastFrameAt : null,
+    lagMs: phone.lags.length && phone.lastFrameAt > now - 3000 ? [...phone.lags].sort((a, b) => a - b)[phone.lags.length >> 1] : null,
   };
 }
 
@@ -155,7 +176,7 @@ function appendFrame(cap, frame) {
     cap.h = frame.h;
   }
   // 錄影中每 60 格存一次清單，當機也不會全丟
-  if (cap.frames.length % 60 === 0) writeJSON(path.join(cap.dir, 'frames.json'), cap.frames);
+  if (cap.frames.length % 60 === 0) writeJSON(path.join(cap.dir, 'frames.json'), cap.frames, { compact: true });
 }
 
 // 開始一場測試：整段錄起來，直到按「結束測試」或手機斷線
@@ -204,7 +225,7 @@ function addMarker(cap) {
 }
 
 function writeClipMeta(cap, status) {
-  writeJSON(path.join(cap.dir, 'frames.json'), cap.frames);
+  writeJSON(path.join(cap.dir, 'frames.json'), cap.frames, { compact: true });
   const meta = {
     id: cap.id,
     kind: cap.kind,
@@ -381,13 +402,24 @@ function broadcast(obj) {
   for (const ws of liveClients) if (ws.readyState === 1) ws.send(msg);
 }
 
-function pushFrameToBrowsers(frame) {
-  for (const ws of liveClients) {
-    if (ws.readyState !== 1) continue;
-    // 瀏覽器來不及吃就跳格，不要越積越多
-    if (ws.bufferedAmount > 2 * 1024 * 1024) continue;
-    ws.send(frame.buf, { binary: true });
+// 給瀏覽器的畫面只送最新的：上一格還沒送完就先記著，送完再送最新那格，不排隊
+function sendLatest(ws, frame) {
+  if (ws.readyState !== 1) return;
+  if (ws._sending) {
+    ws._pending = frame;
+    return;
   }
+  ws._sending = true;
+  ws.send(frame.buf, { binary: true }, () => {
+    ws._sending = false;
+    const next = ws._pending;
+    ws._pending = null;
+    if (next) sendLatest(ws, next);
+  });
+}
+
+function pushFrameToBrowsers(frame) {
+  for (const ws of liveClients) sendLatest(ws, frame);
 }
 
 setInterval(() => {
@@ -489,12 +521,13 @@ function allOpenPrompt(project, session) {
   };
 }
 
-function launchClaude(localPath, prompt, title) {
+function launchClaude(localPath, prompt, title, { resume = false } = {}) {
   if (process.platform !== 'win32') throw new Error('自動開啟 Claude Code 只支援 Windows；請改用「複製給 Claude」');
   if (!localPath || !fs.existsSync(localPath)) throw new Error('這個專案還沒設定電腦上的資料夾，或資料夾不存在（到「設定」填寫）');
   const safeTitle = String(title).replace(/["^&|<>%]/g, '');
   const safePrompt = prompt.replace(/["^&|<>%]/g, '');
-  const cmd = `/c start "${safeTitle}" /D "${localPath}" cmd /k claude "${safePrompt}"`;
+  // resume：接著這個資料夾最近一次的 Claude Code 對話（claude --continue），不開新的
+  const cmd = `/c start "${safeTitle}" /D "${localPath}" cmd /k claude ${resume ? '--continue ' : ''}"${safePrompt}"`;
   const p = spawn('cmd.exe', [cmd], { windowsVerbatimArguments: true, detached: true, stdio: 'ignore' });
   p.unref();
 }
@@ -664,6 +697,41 @@ async function handleApi(req, res, url) {
     }
   }
 
+  // 附檔：每一筆可以附圖片或任何檔案。原始內容直接放在 body，檔名放網址
+  if ((mm = /^\/api\/clips\/([^/]+)\/attachments$/.exec(p)) && m === 'POST') {
+    const id = safeId(mm[1]);
+    const draft = safeId(url.searchParams.get('draft'));
+    const rawName = String(url.searchParams.get('name') || 'file').slice(0, 120);
+    const clean = rawName.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').replace(/^\.+/, '_') || 'file';
+    const dir = path.join(clipDir(id), 'attachments', draft);
+    if (!fs.existsSync(clipDir(id))) return send(res, 404, { error: '找不到這場測試' });
+    fs.mkdirSync(dir, { recursive: true });
+    let name = clean;
+    for (let n = 2; fs.existsSync(path.join(dir, name)); n++) {
+      const ext = path.extname(clean);
+      name = `${path.basename(clean, ext)}-${n}${ext}`;
+    }
+    const chunks = [];
+    let size = 0;
+    const limit = 200 * 1024 * 1024;
+    await new Promise((resolve, reject) => {
+      req.on('data', (c) => {
+        size += c.length;
+        if (size > limit) {
+          reject(new Error('檔案太大（上限 200MB）'));
+          req.destroy();
+        } else chunks.push(c);
+      });
+      req.on('end', resolve);
+      req.on('error', reject);
+    });
+    fs.writeFileSync(path.join(dir, name), Buffer.concat(chunks));
+    return send(res, 200, {
+      ok: true,
+      attachment: { name, file: `attachments/${draft}/${name}`, size, type: String(req.headers['content-type'] || '') },
+    });
+  }
+
   // 插書籤當下順手寫的字：存成那個書籤的草稿
   if ((mm = /^\/api\/clips\/([^/]+)\/quicknote$/.exec(p)) && m === 'POST') {
     const id = safeId(mm[1]);
@@ -733,8 +801,8 @@ async function handleApi(req, res, url) {
 
   if (p === '/api/notes' && m === 'POST') {
     const body = await readBody(req);
-    if (!String(body.description || '').trim() && !(body.annotations || []).length) {
-      return send(res, 400, { error: '請至少畫一個標註或寫一句說明' });
+    if (!String(body.description || '').trim() && !(body.annotations || []).length && !(body.attachments || []).length) {
+      return send(res, 400, { error: '請至少畫一個標註、寫一句說明或附一個檔案' });
     }
     const clip = body.clipId ? readJSON(path.join(clipDir(safeId(body.clipId)), 'meta.json'), null) : null;
     const note = createNote({ ...body, sessionNumber: clip?.number ?? null, project: body.project ?? clip?.project ?? '' });
@@ -756,7 +824,7 @@ async function handleApi(req, res, url) {
   if (p === '/api/notes/launch-ids' && m === 'POST') {
     const body = await readBody(req);
     const proj = projectByName(body.project);
-    launchClaude(proj?.localPath, idsPrompt(body.ids).ascii, `Celery-Check ${body.project || ''}`);
+    launchClaude(proj?.localPath, idsPrompt(body.ids).ascii, `Celery-Check ${body.project || ''}`, { resume: !!body.resume });
     return send(res, 200, { ok: true });
   }
 
@@ -831,6 +899,12 @@ const server = http.createServer(async (req, res) => {
       // 畫面格不會變，可以給瀏覽器快取
       return sendFile(res, file, mm[2] ? { 'Cache-Control': 'max-age=86400' } : {});
     }
+    if ((mm = /^\/clips\/([^/]+)\/attachments\/([A-Za-z0-9_-]+)\/([^/]+)$/.exec(url.pathname))) {
+      return sendFile(res, path.join(clipDir(safeId(mm[1])), 'attachments', mm[2], path.basename(decodeURIComponent(mm[3]))));
+    }
+    if ((mm = /^\/notes\/([^/]+)\/attachments\/([^/]+)$/.exec(url.pathname))) {
+      return sendFile(res, path.join(noteDir(safeId(mm[1])), 'attachments', path.basename(decodeURIComponent(mm[2]))));
+    }
     if ((mm = /^\/notes\/([^/]+)\/([^/]+)$/.exec(url.pathname))) {
       return sendFile(res, path.join(noteDir(safeId(mm[1])), path.basename(decodeURIComponent(mm[2]))));
     }
@@ -841,7 +915,7 @@ const server = http.createServer(async (req, res) => {
     if (!file.startsWith(WEB_DIR)) return send(res, 403, { error: 'no' });
     return sendFile(res, file);
   } catch (e) {
-    console.error('[錯誤]', e);
+    logError(`${req.method} ${url.pathname}`, e);
     return send(res, 500, { error: e.message || String(e) });
   }
 });
@@ -885,7 +959,16 @@ ingestWss.on('connection', (ws, req, url) => {
   broadcast({ type: 'phone', event: 'connected', phone: phoneStatus() });
 
   ws.on('message', (data, isBinary) => {
-    if (isBinary) return onPhoneFrame(Buffer.isBuffer(data) ? data : Buffer.from(data));
+    if (isBinary) {
+      try {
+        onPhoneFrame(Buffer.isBuffer(data) ? data : Buffer.from(data));
+      } catch (e) {
+        logError('收畫面', e);
+      }
+      // 回「收到」：手機要等到這個才送下一格，網路慢時只會跳格，不會越積越慢
+      if (ws.readyState === 1) ws.send('a');
+      return;
+    }
     try {
       const msg = JSON.parse(data.toString());
       if (msg.type === 'hello') {

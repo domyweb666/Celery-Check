@@ -10,6 +10,8 @@ const S = {
   phone: { connected: false },
   session: null,
   pendingJumpMarker: null,
+  frameSeq: 0,
+  drawnSeq: 0,
   latestBitmap: null,
   view: 'live',
   noteFilter: 'todo',
@@ -132,8 +134,15 @@ function connectLive() {
   liveWs.binaryType = 'blob';
   liveWs.onmessage = async (ev) => {
     if (typeof ev.data === 'string') return onLiveMessage(JSON.parse(ev.data));
+    const seq = ++S.frameSeq;
     try {
       const bmp = await createImageBitmap(ev.data);
+      // 解碼比較慢的舊格晚到了，就丟掉，不要蓋掉新的
+      if (seq < S.drawnSeq) {
+        bmp.close();
+        return;
+      }
+      S.drawnSeq = seq;
       const old = S.latestBitmap;
       S.latestBitmap = bmp;
       drawLive();
@@ -180,7 +189,8 @@ function updateStatusUi() {
   const pill = $('#phonePill');
   const p = S.phone || {};
   pill.classList.toggle('on', !!p.connected);
-  $('#phoneText').textContent = p.connected ? `${p.device || 'iPhone'} 投影中 · ${p.fps || 0} 格/秒` : '手機未連線';
+  const lag = p.lagMs != null ? ` · 延遲約 ${(Math.max(0, p.lagMs) / 1000).toFixed(1)} 秒` : '';
+  $('#phoneText').textContent = p.connected ? `${p.device || 'iPhone'} 投影中 · ${p.fps || 0} 格/秒${lag}` : '手機未連線';
 
   const ses = S.session;
   const rec = $('#recPill');
@@ -566,7 +576,7 @@ function markerAtIndex(i) {
 }
 
 function draftHasContent(d) {
-  return !!(d.annotations.length || d.description.trim() || d.range);
+  return !!(d.annotations.length || d.description.trim() || d.range || d.attachments?.length);
 }
 
 function createDraftAt(i) {
@@ -580,6 +590,7 @@ function createDraftAt(i) {
     annotations: [],
     description: '',
     range: null,
+    attachments: [],
     noteId: null,
   };
   R.drafts.push(d);
@@ -602,7 +613,7 @@ async function openReview(id) {
     return (location.hash = '#clips');
   }
   if (S.review) leaveReview();
-  S.review = newReviewState(clip, drafts.map((d) => ({ annotations: [], description: '', range: null, ...d })));
+  S.review = newReviewState(clip, drafts.map((d) => ({ annotations: [], description: '', range: null, attachments: [], ...d })));
   const R = S.review;
   showForm();
   renderReviewHead();
@@ -682,7 +693,13 @@ async function showFrame(i) {
     renderItems();
     setupTimeline();
   }
-  const img = await getFrameImage(i);
+  let img;
+  try {
+    img = await getFrameImage(i);
+  } catch {
+    if (S.review === R && R.index === i) serverTrouble();
+    return false;
+  }
   if (S.review !== R || R.index !== i) return;
   R.currentImage = img;
   if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
@@ -691,6 +708,13 @@ async function showFrame(i) {
   }
   drawReview();
   for (const dd of [1, 2, 3, -1, -2]) if (R.frames[i + dd]) getFrameImage(i + dd);
+}
+
+let troubleShown = 0;
+function serverTrouble() {
+  if (Date.now() - troubleShown < 5000) return;
+  troubleShown = Date.now();
+  toast('讀不到畫面：芹查的黑色視窗是不是被關掉或停住了？重新打開「芹查」後按重新整理', true, 5000);
 }
 
 function frameUrl(i) {
@@ -791,7 +815,8 @@ function renderItems() {
         text = `已送出 #${d.number}　${esc(d.description.split('\n')[0] || '')}`;
       } else if (d && draftHasContent(d)) {
         state = 'draft';
-        text = d.description.trim() ? esc(d.description.split('\n')[0]) : '已框選，還沒寫說明';
+        text = d.description.trim() ? esc(d.description.split('\n')[0]) : d.annotations.length ? '已框選，還沒寫說明' : '還沒寫說明';
+        if (d.attachments?.length) text += `（附 ${d.attachments.length} 個檔）`;
       }
       const current = it.idx === R.index || (d && d.id === R.activeId);
       return `<li class="item ${current ? 'on' : ''}" data-idx="${it.idx}" ${it.marker ? `data-marker="${it.markerT}"` : ''}>
@@ -858,6 +883,7 @@ function renderEditor() {
     del.hidden = true;
   }
   $('#anchorHint').hidden = true;
+  renderAttachments(d);
   const selK = R.markers.findIndex((m) => m.t === R.selMarkerT);
   const mm = $('#markerMove');
   mm.hidden = selK < 0;
@@ -868,6 +894,91 @@ function renderEditor() {
     $('#btnMoveMarker').disabled = here;
     $('#btnMoveMarker').textContent = here ? '← → 找到正確那格再按 M' : '書籤移到這一格（M）';
   }
+}
+
+// ---------- 附檔 ----------
+
+function isImageName(name, type) {
+  return /^image\//.test(type || '') || /\.(png|jpe?g|gif|webp|bmp)$/i.test(name || '');
+}
+
+function renderAttachments(d) {
+  const R = S.review;
+  const list = d?.attachments || [];
+  $('#attachList').innerHTML = list
+    .map((a, k) => {
+      const url = `/clips/${R.clip.id}/${a.file.split('/').map(encodeURIComponent).join('/')}`;
+      const thumb = isImageName(a.name, a.type) ? `<img src="${url}" alt="">` : `<span class="ic">${esc((a.name.split('.').pop() || '檔').slice(0, 4))}</span>`;
+      return `<span class="attach-item">${thumb}<a href="${url}" target="_blank" title="${esc(a.name)}">${esc(a.name)}</a>${d.noteId ? '' : `<button data-rmatt="${k}" title="拿掉">✕</button>`}</span>`;
+    })
+    .join('');
+  $('#btnAttach').hidden = !!d?.noteId;
+}
+
+async function uploadFiles(files) {
+  const R = S.review;
+  if (!R || !files.length) return;
+  let d = activeDraft();
+  if (!d) {
+    d = draftAtIndex(R.index) || createDraftAt(R.index);
+    R.activeId = d.id;
+  }
+  if (d.noteId) return toast(`這一筆已經送出成回報 #${d.number}`, true);
+  d.attachments = d.attachments || [];
+  for (const f of files) {
+    toast(`上傳中：${f.name}…`, false, 1500);
+    try {
+      const r = await fetch(`/api/clips/${R.clip.id}/attachments?draft=${encodeURIComponent(d.id)}&name=${encodeURIComponent(f.name || 'paste.png')}`, {
+        method: 'POST',
+        headers: { 'Content-Type': f.type || 'application/octet-stream' },
+        body: f,
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.status);
+      d.attachments.push(j.attachment);
+    } catch (e) {
+      toast(`${f.name} 上傳失敗：${e.message}`, true);
+    }
+  }
+  scheduleSave();
+  renderEditor();
+}
+
+$('#btnAttach').onclick = () => $('#attachInput').click();
+$('#attachInput').addEventListener('change', (e) => {
+  uploadFiles([...e.target.files]);
+  e.target.value = '';
+});
+$('#attachList').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-rmatt]');
+  const d = activeDraft();
+  if (!b || !d || d.noteId) return;
+  d.attachments.splice(Number(b.dataset.rmatt), 1);
+  scheduleSave();
+  renderEditor();
+});
+// 在說明欄 Ctrl+V 貼上截圖
+$('#fDesc').addEventListener('paste', (e) => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (!files.length) return;
+  e.preventDefault();
+  const stamp = new Date().toTimeString().slice(0, 8).replace(/:/g, '');
+  uploadFiles(files.map((f, i) => (f.name && f.name !== 'image.png' ? f : new File([f], `貼上的圖-${stamp}${i ? `-${i}` : ''}.png`, { type: f.type || 'image/png' }))));
+});
+// 把檔案拖到右邊的編輯區
+for (const el of [$('#editor'), $('#reviewStage')]) {
+  el.addEventListener('dragover', (e) => {
+    if (![...(e.dataTransfer?.types || [])].includes('Files')) return;
+    e.preventDefault();
+    $('#editor').classList.add('drop');
+  });
+  el.addEventListener('dragleave', () => $('#editor').classList.remove('drop'));
+  el.addEventListener('drop', (e) => {
+    if (!e.dataTransfer?.files?.length) return;
+    e.preventDefault();
+    $('#editor').classList.remove('drop');
+    uploadFiles([...e.dataTransfer.files]);
+  });
 }
 
 // 把書籤移到另一格（看到問題到按下去常常慢 1、2 秒）
@@ -920,15 +1031,18 @@ $('#tlTicks').addEventListener('pointerdown', (e) => {
   const R = S.review;
   if (!tick || !R) return;
   e.preventDefault();
+  // 先標記「拖曳中」再停播放：停播放會重畫時間軸，會把手上這個書籤換掉
+  R.draggingMarker = true;
   stopPlayback();
   const oldT = Number(tick.dataset.t);
   R.selMarkerT = oldT;
   const track = $('#tlTrack').getBoundingClientRect();
   const n = R.frames.length;
   let idx = frameIndexAt(oldT);
-  R.draggingMarker = true; // 拖曳中不要重畫時間軸，不然手上的書籤會被換掉
   tick.classList.add('dragging');
-  tick.setPointerCapture(e.pointerId);
+  try {
+    tick.setPointerCapture(e.pointerId);
+  } catch {}
   const onMove = (ev) => {
     const x = Math.min(1, Math.max(0, (ev.clientX - track.left) / track.width));
     idx = Math.round(x * (n - 1));
@@ -982,8 +1096,13 @@ async function saveDrafts(R) {
   R.saveTimer = null;
   try {
     await api('PUT', `/api/clips/${R.clip.id}/drafts`, serializeDrafts(R));
+    R.saveFails = 0;
   } catch (e) {
-    toast(`草稿沒存到：${e.message}`, true);
+    // 存不到就過幾秒自動再試，草稿還在畫面上不會不見
+    R.saveFails = (R.saveFails || 0) + 1;
+    if (R.saveFails === 1 || R.saveFails % 5 === 0) toast(`草稿暫時存不到（${e.message}），會自動再試`, true, 4000);
+    clearTimeout(R.saveTimer);
+    R.saveTimer = setTimeout(() => saveDrafts(R), 3000);
   }
 }
 
@@ -1013,7 +1132,7 @@ function stopPlayback() {
   R.playing = false;
   clearTimeout(R.playTimer);
   $('#btnPlay').textContent = '▶';
-  if (was) {
+  if (was && !R.draggingMarker) {
     renderEditor();
     renderItems();
     setupTimeline();
@@ -1034,7 +1153,7 @@ function togglePlay() {
     if (i >= R.frames.length - 1) return stopPlayback();
     const wait = Math.min(600, Math.max(16, R.frames[i + 1].t - R.frames[i].t));
     R.playTimer = setTimeout(async () => {
-      await showFrame(i + 1);
+      if ((await showFrame(i + 1)) === false) return stopPlayback();
       step();
     }, wait);
   };
@@ -1636,6 +1755,7 @@ async function submitAll() {
         annotations: d.annotations,
         description: d.description.trim(),
         project: R.clip.project || '',
+        attachments: d.attachments || [],
         markerNumber: d.markerT != null ? R.markers.findIndex((m) => m.t === d.markerT) + 1 || null : null,
         sessionDuration: relSec(R.frames.length - 1),
         quiet: true,
@@ -1679,7 +1799,9 @@ async function showDone(sent) {
   $('#doneTitle').textContent = `已送出 ${sent.length} 筆回報`;
   $('#doneSub').textContent = `${R.clip.project || '未分類'}・#${Math.min(...nums)}${nums.length > 1 ? `–#${Math.max(...nums)}` : ''}`;
   const proj = projectByName(R.clip.project);
-  $('#btnLaunch').hidden = !(proj && proj.localPath && S.state?.platform === 'win32');
+  const canLaunch = !!(proj && proj.localPath && S.state?.platform === 'win32');
+  $('#btnLaunch').hidden = !canLaunch;
+  $('#btnLaunchResume').hidden = !canLaunch;
   R.sentIds = nums.join(',');
   try {
     R.prompt = (await api('GET', `/api/notes/prompt-ids?ids=${R.sentIds}`)).prompt;
@@ -1691,6 +1813,14 @@ async function showDone(sent) {
 $('#btnCopyPrompt').onclick = async () => {
   await copyText(S.review.prompt);
   toast('已複製，貼到 Claude Code 就會逐筆處理');
+};
+$('#btnLaunchResume').onclick = async () => {
+  try {
+    await api('POST', '/api/notes/launch-ids', { project: S.review.clip.project, ids: S.review.sentIds, resume: true });
+    toast('已在這個 app 資料夾接著上次的 Claude Code 對話');
+  } catch (e) {
+    toast(e.message, true);
+  }
 };
 $('#btnLaunch').onclick = async () => {
   try {
@@ -1865,6 +1995,16 @@ async function renderNotePage(id) {
           </div>
           ${f.sequence ? `<div class="imgs" style="margin-top:12px">${img(f.sequence, '前後連續畫面（紅框是標註那格）')}</div>` : ''}
         </div>
+        ${
+          f.attachments?.length
+            ? `<div class="card"><h2>附的檔案</h2><div class="note-attach">${f.attachments
+                .map((a) => {
+                  const url = `/notes/${note.id}/attachments/${encodeURIComponent(a.name)}`;
+                  return `<a href="${url}" target="_blank">${isImageName(a.name, a.type) ? `<img src="${url}" alt="">` : ''}<span>${esc(a.name)}</span></a>`;
+                })
+                .join('')}</div></div>`
+            : ''
+        }
       </div>
       <div>
         <div class="card">

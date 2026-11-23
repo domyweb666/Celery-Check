@@ -135,6 +135,19 @@ server.registerTool(
     add(note.files?.full, '【圖二】整張手機畫面＋多米的標註：');
     add(note.files?.sequence, '【圖三】問題發生前後的連續畫面（由左到右、由上到下，紅框那格是多米停下來標註的畫面）：');
     if (note.status === 'reopened' && note.files?.after) add(note.files.after, '【圖四】多米驗收時拍的「修改後」畫面，問題還在：');
+    // 多米附的圖片直接給 Claude 看；其他檔案在文字裡列了完整路徑，可以用 Read 打開
+    for (const a of note.files?.attachments || []) {
+      const isImg = /^image\/(png|jpeg|gif|webp)$/i.test(a.type) || /\.(png|jpe?g|gif|webp)$/i.test(a.name);
+      if (!isImg || (a.size && a.size > 4 * 1024 * 1024)) continue;
+      const fp = path.join(dir, ...a.file.split('/'));
+      try {
+        const buf = fs.readFileSync(fp);
+        const ext = path.extname(a.name).toLowerCase();
+        const mime = ext === '.png' ? 'image/png' : ext === '.gif' ? 'image/gif' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+        content.push({ type: 'text', text: `【附件】${a.name}：` });
+        content.push({ type: 'image', data: buf.toString('base64'), mimeType: mime });
+      } catch {}
+    }
     content.push({
       type: 'text',
       text: '\n修好後請呼叫 celery_mark_fixed，用一兩句中文寫你改了什麼、多米驗收時要看哪裡。看不懂多米的意思時，用 celery_comment 留言問他，不要猜。',
