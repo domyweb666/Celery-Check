@@ -444,3 +444,23 @@ a.rec-pill { text-decoration: none; cursor: pointer; }
 .tick.marker { background: var(--red); }
 .tick.draft { top: 20px; height: 6px; width: 8px; margin-left: -4px; background: #e7a325; border-radius: 3px; }
 .tick.draft.sent { background: #3bb13b; }
+
+/* ---------- 插書籤時順手寫字 ---------- */
+.quicknote {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  width: min(620px, calc(100vw - 32px));
+  background: #1d1f1b;
+  color: #fff;
+  border-radius: 16px;
+  padding: 12px 14px 14px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+  z-index: 60;
+}
+.qn-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 8px; flex-wrap: wrap; }
+.qn-title { font-weight: 700; color: #ff8a8d; }
+.qn-hint { font-size: 12px; color: #a9ada4; }
+.quicknote input { background: #2b2e29; border-color: #3d413a; color: #fff; font-size: 16px; padding: 10px 12px; }
+.quicknote input:focus { outline: 2px solid #ff8a8d; border-color: #ff8a8d; }

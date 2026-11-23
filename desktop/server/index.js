@@ -254,11 +254,13 @@ function sessionSummary(cap) {
   return { id: cap.id, number: cap.number, project: cap.project, startedAt: cap.createdAt, frames: cap.frames.length, markers: cap.markers.length };
 }
 
-// 舊的場次自動清掉（勾「保留」的、還有草稿沒送出的不刪）
+// 舊的場次自動清掉。不刪：勾「保留」的、還有草稿沒送出的、還有回報沒結案的（Claude 可能要回去翻錄影）
 function pruneClips() {
   const clips = listClips().filter((c) => c.status === 'ready' && !c.keep);
+  const inUse = new Set(listNotes().filter((n) => n.status !== 'closed' && n.clipId).map((n) => n.clipId));
   let kept = 0;
   for (const c of clips) {
+    if (inUse.has(c.id)) continue;
     const drafts = readJSON(path.join(clipDir(c.id), 'drafts.json'), []);
     const pending = drafts.some((d) => !d.noteId && (d.description || d.annotations?.length));
     if (pending) continue;
@@ -547,7 +549,9 @@ async function handleApi(req, res, url) {
       started = true;
     }
     const index = addMarker(cap);
-    return send(res, 200, { ok: true, session: sessionSummary(cap), markerIndex: index, started });
+    const markerT = cap.markers[index].t;
+    const rel = cap.frames.length ? (markerT - cap.frames[0].t) / 1000 : 0;
+    return send(res, 200, { ok: true, session: sessionSummary(cap), markerIndex: index, markerT, rel, started });
   }
 
   if (p === '/api/session/stop' && m === 'POST') {
@@ -608,6 +612,40 @@ async function handleApi(req, res, url) {
       broadcast({ type: 'clip', clip: meta });
       return send(res, 200, meta);
     }
+  }
+
+  // 插書籤當下順手寫的字：存成那個書籤的草稿
+  if ((mm = /^\/api\/clips\/([^/]+)\/quicknote$/.exec(p)) && m === 'POST') {
+    const id = safeId(mm[1]);
+    const body = await readBody(req);
+    const text = String(body.text || '').trim();
+    const markerT = Number(body.markerT);
+    if (!text || !Number.isFinite(markerT)) return send(res, 400, { error: '沒有內容' });
+    const dir = clipDir(id);
+    const live = activeCaptures.get(id);
+    const frames = live ? live.frames : readJSON(path.join(dir, 'frames.json'), []);
+    if (!frames.length) return send(res, 404, { error: '找不到這場測試' });
+    let fr = frames[0];
+    for (const x of frames) if (x.t <= markerT) fr = x;
+    const file = path.join(dir, 'drafts.json');
+    const drafts = readJSON(file, []);
+    const existing = drafts.find((d) => d.markerT === markerT && !d.noteId);
+    if (existing) existing.description = existing.description ? `${existing.description}\n${text}` : text;
+    else {
+      drafts.push({
+        id: `q${Date.now().toString(36)}`,
+        f: fr.f,
+        t: fr.t,
+        markerT,
+        annotations: [],
+        description: text,
+        range: null,
+        noteId: null,
+      });
+    }
+    writeJSON(file, drafts);
+    broadcast({ type: 'drafts', clipId: id });
+    return send(res, 200, { ok: true });
   }
 
   // 草稿：排查時寫到一半的標註和說明，存在伺服器上，關掉瀏覽器也不會不見

@@ -236,6 +236,8 @@ export function createNote(input) {
     createdAt: now,
     clipId: input.clipId || null,
     sessionNumber: input.sessionNumber ?? null,
+    markerNumber: Number.isInteger(input.markerNumber) && input.markerNumber > 0 ? input.markerNumber : null,
+    sessionDuration: Number.isFinite(input.sessionDuration) ? input.sessionDuration : null,
     frameFile: input.frameFile || null,
     frameTime: input.frameTime ?? null, // 這一格在片段裡的秒數
     range: input.range || null, // { start, end } 秒
@@ -302,6 +304,12 @@ export function describeAnnotations(note) {
     .concat(size ? `\n（座標是相對畫面的百分比，畫面原始大小 ${size.w}×${size.h}）` : '');
 }
 
+export function fmtClock(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  const m = Math.floor(s / 60);
+  return `${m}:${(s - m * 60).toFixed(1).padStart(4, '0')}`;
+}
+
 function fmtSec(sec) {
   const s = Number(sec) || 0;
   if (s < 60) return `${s.toFixed(1)} 秒`;
@@ -314,9 +322,16 @@ export function noteToText(note) {
   lines.push(`狀態：${STATUS_LABEL[note.status] || note.status}　專案：${note.project || '未分類'}`);
   lines.push(`建立時間：${localTime(note.createdAt)}${note.sessionNumber ? `（第 ${note.sessionNumber} 場測試）` : ''}`);
   if (note.frameTime != null) {
-    let t = `問題畫面在這場測試錄影的第 ${fmtSec(note.frameTime)}`;
-    if (note.range) t += `；多米選的區間是 ${fmtSec(note.range.start)} 到 ${fmtSec(note.range.end)}`;
+    let t = `時間戳：問題畫面在這場測試錄影的 ${fmtClock(note.frameTime)}`;
+    if (note.markerNumber) t += `（多米測試當下插的書籤 ${note.markerNumber}）`;
+    if (note.sessionDuration) t += `，整場錄影長 ${fmtClock(note.sessionDuration)}`;
+    if (note.range) t += `；多米特別選的區間是 ${fmtClock(note.range.start)} 到 ${fmtClock(note.range.end)}`;
     lines.push(t);
+    if (note.clipId) {
+      lines.push(
+        `想看更多前後畫面（例如多米是怎麼操作到這一步的），用 celery_get_frames 指定時間範圍自己翻錄影；想看整場測試的流程，用 celery_get_session。`,
+      );
+    }
   }
   lines.push('');
   lines.push('## 多米的說明');

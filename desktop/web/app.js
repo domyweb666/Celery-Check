@@ -296,25 +296,90 @@ async function renderRecentClips() {
 }
 
 async function doMarker() {
+  await saveQuickNote(); // 上一個書籤的字還沒按 Enter，先存起來
   try {
     const r = await api('POST', '/api/session/marker');
     S.session = r.session;
     updateStatusUi();
-    if (r.started) toast(`已開始第 ${r.session.number} 場測試，插入第 1 個書籤`);
-    else toast(`書籤 ${r.markerIndex + 1}`, false, 1200);
+    if (r.started) toast(`已開始第 ${r.session.number} 場測試`);
     const reviewingThis = S.view === 'review' && S.review?.clip?.id === r.session.id;
     if (S.config.openReviewAfterMark && !reviewingThis) {
       S.pendingJumpMarker = r.markerIndex;
       location.hash = `#review/${r.session.id}`;
+      return;
     }
+    openQuickNote({ clipId: r.session.id, markerT: r.markerT, index: r.markerIndex, rel: r.rel });
   } catch (e) {
     toast(e.message, true);
   }
 }
 
+// ---------- 插書籤當下順手寫字 ----------
+
+function openQuickNote(q) {
+  S.quick = q;
+  $('#qnTitle').textContent = `書籤 ${q.index + 1}・${fmtRel(q.rel || 0)}`;
+  const input = $('#qnInput');
+  input.value = '';
+  $('#quickNote').hidden = false;
+  setTimeout(() => input.focus(), 0);
+}
+
+function closeQuickNote() {
+  S.quick = null;
+  $('#quickNote').hidden = true;
+  $('#qnInput').blur();
+}
+
+async function saveQuickNote() {
+  const q = S.quick;
+  if (!q) return;
+  const text = $('#qnInput').value.trim();
+  closeQuickNote();
+  if (!text) return;
+  const R = S.review;
+  try {
+    if (R && R.clip.id === q.clipId) {
+      // 排查畫面正開著這場：直接寫進畫面上的草稿，免得被覆蓋
+      await reloadReviewClip();
+      const i = frameIndexAt(q.markerT);
+      let d = liveDrafts().find((x) => x.markerT === q.markerT && !x.noteId) || draftAtIndex(i);
+      if (!d || d.noteId) d = createDraftAt(i);
+      d.description = d.description ? `${d.description}\n${text}` : text;
+      scheduleSave();
+      renderEditor();
+    } else {
+      await api('POST', `/api/clips/${q.clipId}/quicknote`, { markerT: q.markerT, text });
+    }
+    toast(`書籤 ${q.index + 1} 已記下`, false, 1200);
+  } catch (e) {
+    toast(`沒存到：${e.message}`, true);
+  }
+}
+
+$('#qnInput').addEventListener('keydown', (e) => {
+  e.stopPropagation();
+  if (e.isComposing) return; // 注音選字中的 Enter 不算
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    saveQuickNote();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    closeQuickNote();
+  } else if ((S.config?.markKeys || []).includes(e.key) && e.key.length > 1) {
+    // 正在打字時又踩了踏板：先存這個，再插下一個書籤
+    e.preventDefault();
+    if (!e.repeat) doMarker();
+  } else if ((S.config?.recordKeys || []).includes(e.key) && e.key.length > 1) {
+    e.preventDefault();
+    saveQuickNote().then(toggleSession);
+  }
+});
+
 async function toggleSession() {
   try {
     if (S.session) {
+      await saveQuickNote();
       const id = S.session.id;
       await api('POST', '/api/session/stop');
       S.session = null;
@@ -1386,12 +1451,12 @@ async function buildSequence(R, anchorIdx, range) {
     for (let i = frameIndexAt(range.startT); i <= frameIndexAt(range.endT); i++) idxs.push(i);
   } else {
     const t = R.frames[anchorIdx].t;
-    // 往前後找，畫面沒變動時格子很稀，最多往外找 3 秒
-    for (let i = anchorIdx; i >= 0 && t - R.frames[i].t <= 1500; i--) idxs.unshift(i);
-    for (let i = anchorIdx + 1; i < R.frames.length && R.frames[i].t - t <= 1500; i++) idxs.push(i);
+    // 問題前 3 秒到後 1 秒：讓 Claude 看到你是怎麼操作到這一步的
+    for (let i = anchorIdx; i >= 0 && t - R.frames[i].t <= 3000; i--) idxs.unshift(i);
+    for (let i = anchorIdx + 1; i < R.frames.length && R.frames[i].t - t <= 1000; i++) idxs.push(i);
   }
   if (idxs.length < 2) return null;
-  const MAX = 8;
+  const MAX = 10;
   let pick = idxs;
   if (idxs.length > MAX) {
     pick = [];
@@ -1405,7 +1470,7 @@ async function buildSequence(R, anchorIdx, range) {
   }
   const imgs = await Promise.all(pick.map((i) => getFrameImage(i)));
   const tw = 200, th = Math.round((tw * imgs[0].naturalHeight) / imgs[0].naturalWidth);
-  const cols = Math.min(4, pick.length), rows = Math.ceil(pick.length / cols);
+  const cols = Math.min(5, pick.length), rows = Math.ceil(pick.length / cols);
   const gap = 10, label = 26;
   const c = document.createElement('canvas');
   c.width = cols * tw + (cols + 1) * gap;
@@ -1440,6 +1505,10 @@ async function submitAll() {
     .filter((d) => !d.noteId && draftHasContent(d))
     .sort((a, b) => a.t - b.t);
   if (!pending.length) return toast('還沒有要送出的回報', true);
+  if (!R.clip.project) {
+    $('#sessProject').focus();
+    return toast('先在右上方「測哪個 app」選好是哪個 app，Claude Code 才對得到專案', true, 4000);
+  }
   const empty = buildItems().filter((it) => it.marker && !(it.draft && draftHasContent(it.draft))).length;
   if (empty && !confirm(`還有 ${empty} 個書籤沒寫。先把寫好的 ${pending.length} 筆送出？（沒寫的書籤會留著，之後可以再補）`)) return;
   const noDesc = pending.filter((d) => !d.description.trim()).length;
@@ -1466,6 +1535,8 @@ async function submitAll() {
         annotations: d.annotations,
         description: d.description.trim(),
         project: R.clip.project || '',
+        markerNumber: d.markerT != null ? R.markers.findIndex((m) => m.t === d.markerT) + 1 || null : null,
+        sessionDuration: relSec(R.frames.length - 1),
         quiet: true,
         images: {
           full: full.toDataURL('image/png'),

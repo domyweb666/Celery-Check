@@ -7,7 +7,7 @@ import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { loadConfig, saveConfig, listNotes, listClips, getNote, noteDir, noteToText, updateNoteStatus, STATUS_LABEL, localTime } from './store.js';
+import { loadConfig, saveConfig, listNotes, listClips, getClip, clipDir, readJSON, getNote, noteDir, noteToText, updateNoteStatus, STATUS_LABEL, localTime, fmtClock } from './store.js';
 
 // ---------------------------------------------------------------------------
 // Claude Code 是在哪個專案資料夾打開的？
@@ -203,6 +203,159 @@ server.registerTool(
       text: '\n修好後請呼叫 celery_mark_fixed，用一兩句中文寫你改了什麼、多米驗收時要看哪裡。看不懂多米的意思時，用 celery_comment 留言問他，不要猜。',
     });
     return { content };
+  },
+);
+
+// ---------------------------------------------------------------------------
+// 翻錄影：Claude 看不了影片，但可以指定時間範圍抓畫面
+// ---------------------------------------------------------------------------
+
+function resolveSession({ id, session }) {
+  if (session) return { clipId: String(session), note: null };
+  if (id) {
+    const note = getNote(String(id).replace(/^#/, ''));
+    if (!note) throw new Error(`找不到回報 #${id}`);
+    if (!note.clipId) throw new Error(`回報 #${note.number} 沒有對應的測試錄影`);
+    return { clipId: note.clipId, note };
+  }
+  throw new Error('請給回報編號（id）或測試場次（session）');
+}
+
+function loadSession(clipId) {
+  let clip;
+  try {
+    clip = getClip(clipId);
+  } catch {
+    clip = null;
+  }
+  if (!clip || !clip.frames?.length) throw new Error('這場測試的錄影已經不在了（可能被刪除），只剩回報本身的圖片');
+  return clip;
+}
+
+function pickEvenly(list, n) {
+  if (list.length <= n) return list;
+  const out = [];
+  for (let k = 0; k < n; k++) out.push(list[Math.round((k * (list.length - 1)) / (n - 1))]);
+  return [...new Set(out)];
+}
+
+server.registerTool(
+  'celery_get_frames',
+  {
+    title: '翻測試錄影',
+    description:
+      '從多米的測試錄影裡，抓指定時間範圍的畫面來看（Claude 看不了影片，用這個代替）。回報裡的連續畫面不夠判斷時用，例如想知道多米是怎麼操作到出問題那一步、動畫怎麼跑的、問題出現前畫面長怎樣。時間用「錄影裡的秒數」，回報文字裡的時間戳就是這個。',
+    inputSchema: {
+      id: z.string().optional().describe('回報編號。給了就翻這筆回報所在的那場測試；不給 from/to 時，預設抓問題前 6 秒到後 2 秒'),
+      session: z.string().optional().describe('測試場次 id（不給回報編號時用）'),
+      from: z.number().optional().describe('從錄影第幾秒開始'),
+      to: z.number().optional().describe('到錄影第幾秒'),
+      count: z.number().int().min(2).max(16).optional().describe('要幾張，預設 8，最多 16'),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ id, session, from, to, count = 8 }) => {
+    try {
+      const { clipId, note } = resolveSession({ id, session });
+      const clip = loadSession(clipId);
+      const t0 = clip.frames[0].t;
+      const total = (clip.frames[clip.frames.length - 1].t - t0) / 1000;
+      const center = note?.frameTime ?? 0;
+      const a = Math.max(0, from ?? center - 6);
+      const b = Math.min(total, to ?? (from != null ? a + 8 : center + 2));
+      if (b <= a) return textResult(`時間範圍不對：${fmtClock(a)} 到 ${fmtClock(b)}（整場錄影 0:00.0 到 ${fmtClock(total)}）`, true);
+      const inRange = clip.frames.filter((f) => f.t >= t0 + a * 1000 && f.t <= t0 + b * 1000);
+      if (!inRange.length) {
+        // 畫面靜止時手機不送新格：拿這段時間開始前的最後一格
+        let last = clip.frames[0];
+        for (const f of clip.frames) if (f.t <= t0 + a * 1000) last = f;
+        inRange.push(last);
+      }
+      let pick = pickEvenly(inRange, count);
+      // 多米標註的那一格在範圍內的話，一定要放進去
+      if (note?.frameFile) {
+        const marked = inRange.find((f) => f.f === note.frameFile);
+        if (marked && !pick.includes(marked)) {
+          let near = 0;
+          pick.forEach((f, k) => (Math.abs(f.t - marked.t) < Math.abs(pick[near].t - marked.t) ? (near = k) : 0));
+          pick[near] = marked;
+          pick = [...new Set(pick)].sort((x, y) => x.t - y.t);
+        }
+      }
+      const dir = path.join(clipDir(clipId), 'frames');
+      const content = [
+        {
+          type: 'text',
+          text: `第 ${clip.number ?? '?'} 場測試（${clip.project || '未分類'}），錄影 ${fmtClock(a)} 到 ${fmtClock(b)}，這段有 ${inRange.length} 格，取 ${pick.length} 張。整場長 ${fmtClock(total)}。畫面沒變動時手機不會送新格，所以格與格之間的時間不一定平均。`,
+        },
+      ];
+      for (const f of pick) {
+        const img = imageContent(path.join(dir, f.f));
+        if (!img) continue;
+        const rel = (f.t - t0) / 1000;
+        const mark = note && f.f === note.frameFile ? '（多米標註的那一格）' : '';
+        content.push({ type: 'text', text: `${fmtClock(rel)}${mark}` });
+        content.push(img);
+      }
+      return { content };
+    } catch (e) {
+      return textResult(e.message, true);
+    }
+  },
+);
+
+server.registerTool(
+  'celery_get_session',
+  {
+    title: '看整場測試的概覽',
+    description:
+      '看多米一整場測試的概覽：測哪個 app、多長、每個書籤的時間和多米當下寫的字、這場送出的所有回報，以及整場平均取樣的畫面。處理同一場的多筆回報前先看這個，能理解多米的操作流程和問題之間的關聯。',
+    inputSchema: {
+      id: z.string().optional().describe('任一筆回報的編號（會找它所在的那場）'),
+      session: z.string().optional().describe('測試場次 id'),
+      frames: z.number().int().min(0).max(16).optional().describe('整場平均取幾張畫面，預設 10；0 表示只要文字'),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ id, session, frames = 10 }) => {
+    try {
+      const { clipId } = resolveSession({ id, session });
+      const clip = loadSession(clipId);
+      const t0 = clip.frames[0].t;
+      const total = (clip.frames[clip.frames.length - 1].t - t0) / 1000;
+      const notes = listNotes()
+        .filter((n) => n.clipId === clipId)
+        .sort((x, y) => (x.frameTime ?? 0) - (y.frameTime ?? 0));
+      const drafts = readJSON(path.join(clipDir(clipId), 'drafts.json'), []);
+      const lines = [];
+      lines.push(`# 第 ${clip.number ?? '?'} 場測試（session: ${clipId}）`);
+      lines.push(`app：${clip.project || '未分類'}　開始：${localTime(clip.createdAt)}　長度：${fmtClock(total)}${clip.status === 'capturing' ? '　（還在錄）' : ''}`);
+      lines.push('');
+      lines.push(`## 書籤（多米測試當下覺得有問題的時刻，共 ${(clip.markers || []).length} 個）`);
+      (clip.markers || []).forEach((m, k) => {
+        const d = drafts.find((x) => x.markerT === m.t);
+        const note = d?.noteId ? notes.find((n) => n.id === d.noteId) : null;
+        const what = note ? `→ 回報 #${note.number}［${STATUS_LABEL[note.status]}］${note.title}` : d?.description ? `→ 還沒送出：${d.description.split('\n')[0]}` : '→ 多米沒寫說明';
+        lines.push(`- 書籤 ${k + 1}　${fmtClock((m.t - t0) / 1000)}　${what}`);
+      });
+      lines.push('');
+      lines.push(`## 這場送出的回報（共 ${notes.length} 筆）`);
+      for (const n of notes) lines.push(`- #${n.number}　${fmtClock(n.frameTime ?? 0)}　［${STATUS_LABEL[n.status]}］${n.title}`);
+      const content = [{ type: 'text', text: lines.join('\n') }];
+      if (frames > 0) {
+        content.push({ type: 'text', text: `\n## 整場平均取樣的 ${frames} 張畫面（看操作流程用；細節用 celery_get_frames 指定時間範圍）` });
+        const dir = path.join(clipDir(clipId), 'frames');
+        for (const f of pickEvenly(clip.frames, frames)) {
+          const img = imageContent(path.join(dir, f.f));
+          if (!img) continue;
+          content.push({ type: 'text', text: fmtClock((f.t - t0) / 1000) });
+          content.push(img);
+        }
+      }
+      return { content };
+    } catch (e) {
+      return textResult(e.message, true);
+    }
   },
 );
 
